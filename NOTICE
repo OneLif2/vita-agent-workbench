@@ -1,0 +1,9 @@
+Vita Agent Workbench
+Copyright 2026 OneLif2 and contributors
+
+Original Workbench code is provided under Apache License 2.0.
+This is NOT an Apache-only source tree. Third-party material retains its own license.
+See THIRD_PARTY_NOTICES.md, LICENSES/, and notices inside individual source files.
+In particular the VitaShell-derived head.bin template is GPLv3 and JetBrains Mono
+font data is SIL OFL 1.1. No VPK, library, firmware dump, private key or game package
+is distributed in this source-only publication.

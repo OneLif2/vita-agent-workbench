@@ -1,0 +1,129 @@
+#include <assert.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#include <inttypes.h>
+#include "wb_ver.h"
+#include "wb_quick_open.h"
+#define WB_E_STATE (-14)
+#define WB_ROOT "ux0:data/INAP00018"
+#define WB_OK 0
+#define WB_PORT 2222
+#define SCE_CTRL_START 1
+#define SCE_CTRL_SELECT 2
+#define SCE_CTRL_SQUARE 4
+#define SCE_CTRL_CROSS 8
+typedef struct {unsigned buttons;} SceCtrlData;
+typedef struct {int cb,app_rc,rtc_rc;unsigned power;struct{int isSystemUiOverlaid;}state;} FocusEvidence;
+static struct {char user_pin[65],pin[65],ip[16],peer[4][16],run_hex[17];int peer_count,power_cb;unsigned power_calls,guard_strikes;uint64_t guard_grace,absorb_last,guard_last;bool power_registered,resilient,remote_start;} a;
+static struct {char host_pin[65],error[64];bool listening,busy;void*session;} g_ssh;
+static struct {int overlay,rtc_error,app_error,callback,pad_rc,buttons,ac,suspend,low,power,strict,identity,owner_match,host_match,enabled,import_ok,prepare_rc,watch_rc,net_ok,bind_rc,ret,consumed,intent,ret_valid,log_ok,audit_rc,audit_wrong,late_select,late_host,mirror,save_fail;} m;
+static int waits,power_drains,prompts,enroll_allowed,binds,prepares,logs,audit_ok,audit_error,revokes,standing_revokes,optouts,ticks;
+static uint64_t fake_ms;
+static FocusEvidence read_focus(void){FocusEvidence e={.cb=m.callback,.app_rc=m.app_error,.rtc_rc=m.rtc_error,.power=(unsigned)m.power,.state={m.overlay}};return e;}
+static int sceCtrlPeekBufferPositive(int port,SceCtrlData*p,int n){assert(port==0&&n==1);p->buttons=(unsigned)m.buttons;return m.pad_rc;}
+static int scePowerIsPowerOnline(void){return m.ac;}
+static int scePowerIsSuspendRequired(void){return m.suspend;}
+static int scePowerIsLowBattery(void){return m.low;}
+static bool log_event(const char*s){assert(s&&strlen(s)<120);logs++;if(!strncmp(s,"INSTALLED WBQ2 AUDIT ERROR",25))audit_error++;else if(!strncmp(s,"INSTALLED WBQ2 ",15))audit_ok++;return m.log_ok;}
+static bool quick_enabled(void){return m.enabled>0&&m.enabled<=3;}
+static bool quick_pair_is_enrolled(void){return m.identity&&wb_quick_pair(a.user_pin,m.host_match?WB_QUICK_HOST:WB_QUICK_OWNER);}
+static bool quick_veto(void){SceCtrlData p={0};return sceCtrlPeekBufferPositive(0,&p,1)<=0 || (p.buttons&(SCE_CTRL_START|SCE_CTRL_SELECT));}
+static int wq_installed_receipt(const char*p,const char*v,char*out){assert(!strcmp(p,"ux0:app/INAP00018")&&!strcmp(v,WB_VERSION));if(m.audit_rc)return m.audit_rc;snprintf(out,WBQ_CAP,"WBQ2 %s %064d 123\n",m.audit_wrong?"00.01":WB_VERSION,1);return WB_OK;}
+#include "wb_remote_start_vita.h"
+static void load_config(void){strcpy(a.ip,"192.0.2.10");}
+static int wb_vita_read_small(const char*p,void*b,size_t c,size_t*n){(void)p;assert(c>6);if(m.strict){strcpy(b,"strict");*n=6;return WB_OK;}return -1;}
+static void load_peers(void){}
+static const char*wait_initial_focus(void){waits++;return m.overlay||m.rtc_error||m.app_error||m.callback?"FOCUS CHECK FAILED":NULL;}
+static bool import_public_pin(void){if(!m.import_ok)return false;strcpy(a.user_pin,m.owner_match?WB_QUICK_OWNER:WB_QUICK_HOST);return true;}
+static wb_quick_route quick_route(void){return quick_enabled()&&quick_pair_is_enrolled()?WB_Q_LOCAL:WB_Q_NONE;}
+static bool r1_boot(wb_r1_ticket*t){strcpy(t->host_pin,WB_QUICK_HOST);return m.ret!=0;}
+static bool wb_arm_consume(char job[64]){strcpy(job,"return-01_89");return m.consumed!=0;}
+static bool return_intent_take(void){return m.intent!=0;}
+static bool wb_ssh_host_identity_enrolled(void){return m.identity!=0;}
+static void startup_mark(const char*s,int n){(void)s;(void)n;}
+static int await_choice(const char*s,const char*p,int b,int ms){(void)s;(void)p;(void)b;(void)ms;prompts++;return 0;}
+static int wb_ssh_prepare(void*s,const char*p,bool allow){assert(s==&g_ssh&&p==a.user_pin);prepares++;enroll_allowed=allow;strcpy(g_ssh.host_pin,m.host_match?WB_QUICK_HOST:WB_QUICK_OWNER);return !m.identity?-1:m.prepare_rc;}
+static void wb_strcpy(char*d,size_t n,const char*s){assert(strlen(s)<n);strcpy(d,s);}
+static void power_note(void){}
+static int sceKernelCreateCallback(const char*n,int f,void(*cb)(void),void*p){assert(n&&f==0&&cb&&p==NULL);return m.watch_rc? -1:1;}
+static int scePowerRegisterCallback(int x){assert(x>0);return m.watch_rc;}
+static uint64_t now_ms(void){return fake_ms+1;}
+static char pw_diag_source[17];
+static const char*initial_power_drain(uint64_t start,bool u,bool q,bool r,bool ack){(void)start;(void)u;(void)q;(void)r;(void)ack;power_drains++;return m.power||!m.ac||m.low||m.suspend?"POWER EVENT - REOPEN APP":NULL;}
+static bool foreground(bool capture){(void)capture;return !m.overlay&&!m.rtc_error&&!m.app_error&&!m.callback;}
+static uint64_t r1_now(void){return 1;}
+static bool fixture_ret_valid(const wb_r1_ticket*t,uint64_t now){(void)t;(void)now;return m.ret_valid!=0;}
+#define wb_r1_valid fixture_ret_valid
+static const char*prep_listener(void){prompts++;return "CONSENT REQUIRED";}
+static bool net_setup(void){if(m.late_select)m.buttons=SCE_CTRL_SELECT;if(m.late_host)strcpy(g_ssh.host_pin,WB_QUICK_OWNER);return m.net_ok!=0;}
+static int timeline_event(const char*s,const char*v,const char*r){(void)s;(void)v;(void)r;return 0;}
+static int quick_pref(void){return m.enabled;}
+static int wb_ssh_open(void*s,const char*ip,int port,const char(*peer)[16],int count){assert(s==&g_ssh&&ip&&port==2222&&peer&&count>=0);binds++;if(m.bind_rc==WB_OK)g_ssh.listening=true;return m.bind_rc;}
+static bool private_link(void){return m.net_ok!=0;}
+static const char *boot(void){const char *reason=NULL;
+ACTUAL_STARTUP
+return NULL;
+out:return reason;}
+typedef struct{bool repeating;} wb_panel_keys;
+static int r1_notice;
+static void wb_notice_cancel(void*p){assert(p==&r1_notice);}
+static bool wb_mirror_active(void){return m.mirror!=0;}
+static unsigned wb_panel_action(wb_panel_keys*p,unsigned b,uint64_t t){(void)p;(void)b;(void)t;return 0;}
+static void wb_panel_apply(unsigned k,bool r){(void)k;(void)r;}
+static bool wb_standing_veto(void){standing_revokes++;return true;}
+static int r1_revoke(void){revokes++;return WB_OK;}
+static bool quick_switch(bool enabled){if(m.save_fail)return false;m.enabled=enabled?1:0;optouts++;return true;}
+static void review_return_local(void){}
+static void ui_refresh(const char*p,const char*s){assert(!p&&s);}
+#define SCE_CTRL_TRIANGLE 16
+#define SCE_KERNEL_POWER_TICK_DISABLE_AUTO_SUSPEND 1
+static int sceKernelPowerTick(int x){assert(x==1);ticks++;return 0;}
+static void absorb_focus(void){}
+ACTUAL_ADMISSION
+static bool runtime(int mode){
+ const char*reason=NULL;bool owner_exit_from_listener=false;
+ bool local_released=false,remote_input_unknown=false,remote_select_down=false;
+ (void)remote_input_unknown;(void)remote_select_down;
+ wb_panel_keys panel_keys={0};
+ for(int i=0;i<8;i++){
+  fake_ms+=1000;uint64_t mono=now_ms();SceCtrlData pad={0};
+  if(mode==0){m.pad_rc=0;m.buttons=0;}
+  if(mode==1||mode==2){m.pad_rc=i==0||i==3?0:1;m.buttons=i==0||i==5?0:(mode==2?SCE_CTRL_SELECT|SCE_CTRL_SQUARE:SCE_CTRL_SELECT);}
+  if(mode==3){m.net_ok=0;m.pad_rc=1;m.buttons=0;}
+  if(mode==4){m.pad_rc=1;m.buttons=SCE_CTRL_START;}
+  if(mode==5){m.pad_rc=1;m.buttons=i==0?SCE_CTRL_SELECT:SCE_CTRL_SELECT|SCE_CTRL_SQUARE;}
+  if(mode==6){m.pad_rc=1;m.buttons=SCE_CTRL_SELECT|SCE_CTRL_SQUARE;m.save_fail=1;}
+ACTUAL_RUNTIME_INPUT
+ACTUAL_RUNTIME_GUARD
+ }
+ (void)owner_exit_from_listener;
+ return reason==NULL;
+}
+static void reset(void){memset(&m,0,sizeof m);memset(&a,0,sizeof a);memset(&g_ssh,0,sizeof g_ssh);m.pad_rc=m.identity=m.owner_match=m.host_match=m.enabled=m.import_ok=m.net_ok=m.ret_valid=m.log_ok=1;m.strict=1;m.overlay=1;m.power=0x1080;waits=power_drains=prompts=binds=prepares=logs=audit_ok=audit_error=0;enroll_allowed=-1;revokes=standing_revokes=optouts=ticks=0;fake_ms=0;}
+static void one(const char*name,bool allow){
+ const char*why=boot();
+ if((why==NULL)!=allow){fprintf(stderr,"%s unexpected why=%s bind=%d\n",name,why?why:"none",binds);assert(0);}
+ assert((g_ssh.listening!=0)==allow);
+ if(allow){assert(prompts==0&&enroll_allowed==0&&power_drains==0&&waits==0&&a.resilient);}
+}
+int main(int argc,char**argv){
+ bool baseline=argc>2&&!strcmp(argv[2],"blocked");
+ if(argc>1&&!strcmp(argv[1],"overlay-battery")){reset();const char*why=boot();printf("overlay-battery state=%s prompts=%d waits=%d power_drains=%d allow_enroll=%d binds=%d\n",why?"blocked":"listener",prompts,waits,power_drains,enroll_allowed,binds);assert((why!=NULL)==baseline);return 0;}
+ assert(!baseline);int n=0;
+ for(int mode=0;mode<19;mode++){reset();switch(mode){case 0:break;case 1:m.power=0;break;case 2:m.power=0x80;break;case 3:m.ac=1;break;case 4:m.pad_rc=0;break;case 5:m.pad_rc=-1;break;case 6:m.rtc_error=-1;break;case 7:m.app_error=-1;break;case 8:m.callback=1;break;case 9:m.low=1;break;case 10:m.suspend=1;break;case 11:m.ret=1;break;case 12:m.intent=1;break;case 13:m.consumed=1;break;case 14:m.power=0x20000000;break;case 15:m.overlay=0;m.power=0;break;case 16:m.enabled=3;break;case 17:m.audit_rc=-8;break;case 18:m.audit_wrong=1;break;}
+ one("known-pair",true);assert(audit_error==(mode>=17)&&audit_ok==(mode<17));n++;}
+ for(int mode=0;mode<16;mode++){reset();switch(mode){case 0:m.owner_match=0;break;case 1:m.host_match=0;break;case 2:m.identity=0;break;case 3:m.enabled=0;break;case 4:m.enabled=-1;break;case 5:m.import_ok=0;break;case 6:m.prepare_rc=-1;break;case 7:m.watch_rc=-1;break;case 8:m.net_ok=0;break;case 9:m.bind_rc=-1;break;case 10:m.buttons=SCE_CTRL_START;break;case 11:m.buttons=SCE_CTRL_SELECT;break;case 12:m.log_ok=0;break;case 13:m.intent=1;m.late_select=1;break;case 14:m.intent=1;m.late_host=1;break;case 15:m.ret=1;m.ret_valid=0;break;}
+ one("denied",false);n++;}
+ reset();one("runtime-base",true);assert(!foreground(false));assert(runtime(0));assert(revokes==0);n++;
+ reset();one("runtime-select",true);assert(runtime(1));assert(revokes==2&&standing_revokes==2);n++;
+ reset();one("runtime-optout",true);assert(!runtime(2));assert(optouts==1&&m.enabled==0);n++;
+ reset();one("runtime-network",true);assert(!runtime(3));assert(!gate_ok(NULL));n++;
+ reset();one("runtime-start",true);assert(!runtime(4));assert(revokes==1);n++;
+ reset();one("runtime-select-chord",true);assert(!runtime(5));assert(revokes==1&&optouts==1);n++;
+ reset();one("runtime-disable-failed",true);assert(!runtime(6));assert(optouts==0&&m.enabled==1);n++;
+ reset();one("admission",true);assert(gate_ok(NULL));m.net_ok=0;assert(!gate_ok(NULL));n++;
+ printf("PASS %d actual-startup paired remote recovery cases; SDK stubs, no Vita\n",n);
+ return 0;
+}

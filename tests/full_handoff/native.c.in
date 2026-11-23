@@ -1,0 +1,150 @@
+
+#include <inttypes.h>
+#define SCE_O_WRONLY 1
+#define SCE_O_CREAT 2
+#define SCE_O_TRUNC 4
+static unsigned launch_calls,helper_calls,arm_calls,sync_calls;
+static uint64_t mid_delay_us;
+static enum fault_mode mid_fault;
+static int helper_fail,fence_fail,inject_at;
+static bool wrong_pin,wrong_run;
+static void operation(int at) {
+    if(inject_at!=at)return;
+    wall+=mid_delay_us;mono+=mid_delay_us/1000u;
+    switch(mid_fault){
+        case FD_FOCUS:has_fg=false;break;
+        case FD_APP:++fg_app;break;
+        case FD_SYSTEM:++fg_system;break;
+        case FD_WALL_REWIND:wall-=mid_delay_us+1u;break;
+        case FD_WALL_JUMP:wall+=200001u;break;
+        case FD_MONO_SKEW:mono+=201u;break;
+        case FD_POWER:++a.power_calls;break;
+        case FD_CALLBACK:fg_callback=1;break;
+        case FD_INPUT:bad_input=true;break;
+        case FD_SELECT:pads=SCE_CTRL_SELECT;break;
+        case FD_START:pads=SCE_CTRL_START;break;
+        case FD_BAD_STAGE:stage[11]='a';break;
+        case FD_MONO_REWIND:mono-=mid_delay_us/1000u+1u;break;
+        case FD_WALL_STOP:wall-=mid_delay_us;break;
+        case FD_RTC_ERR:fg_rtc_rc=-1;break;
+        case FD_APP_ERR:fg_app_rc=-1;break;
+        case FD_POWER_WRAP:fg_power=0x1080u;break;
+        case FD_LATCHED:fg_latched=true;break;
+        default:break;
+    }
+    if(wrong_pin)a.pin=own;
+    if(wrong_run)a.run_hex="1111111111111111";
+}
+static bool wb_vita_exists(const char *p){assert(p);if(!strcmp(p,WBQ_TEST))operation(5);return false;}
+static int wb_vita_read_small(const char *p,void *buf,size_t cap,size_t *got){
+    assert(!strcmp(p,WB_PENDING_PATH));*got=10;assert(cap>=*got);memcpy(buf,stage,*got);return WB_OK;
+}
+static int timeline_event(const char*x,const char*y,const char*z){assert(x&&y&&z);return WB_OK;}
+SceUID sceIoOpen(const char*p,int flags,SceMode mode){assert(p&&flags&&mode);return 7;}
+int sceIoWrite(int fd,const void *b,SceSize n){assert(fd==7&&b&&n);return (int)n;}
+int sceIoSyncByFd(int fd,int flags){assert(fd==7&&!flags);sync_calls++;operation(1);return 0;}
+int sceIoClose(int fd){assert(fd==7);return 0;}
+static int wb_arm_issue(const char*j,const char*t){assert(j&&t);arm_calls++;operation(2);return WB_OK;}
+static void startup_mark(const char*s,int n){(void)s;(void)n;}
+static int wb_updater_install(int*detail){assert(detail);*detail=1;helper_calls++;operation(3);return helper_fail?WB_E_IO:WB_OK;}
+static const char*wb_updater_decision(void){return "helper=reuse epoch=01.73 promote=0";}
+static void wb_handoff_note(const char*s,int n){(void)s;(void)n;}
+const char*wb_err_name(int n){(void)n;return "io-error";}
+static bool quick_barrier(void){operation(4);return !fence_fail;}
+static int wq_mkdir(const char*p){assert(p);return WB_OK;}
+static int wb_updater_launch(void){launch_calls++;return 0;}
+static int actual_handoff(const wb_cmd*cmd,wb_out*out,int*status){
+    switch(cmd->kind){
+#include "handoff.inc"
+        default:return WB_E_STATE;
+    }
+}
+static unsigned phase(void){r1_local s={0};assert(r1_get(R1_LOCAL_PATH,&s,sizeof s));return (unsigned)s.phase;}
+static void ready(void){
+    inject_active=false;late_power=late_skew=late_cancel_fail=false;fault_mode=FD_NONE;enroll();accepted();stage_calls=0;
+    launch_calls=helper_calls=arm_calls=sync_calls=0;mid_delay_us=0;mid_fault=FD_NONE;
+    helper_fail=fence_fail=0;inject_at=3;wrong_pin=wrong_run=false;
+    late_power=late_skew=late_cancel_fail=false;a.updater_accepted=false;a.guard_grace=0;inject_active=true;
+}
+static int execute(bool manual){
+    wb_cmd cmd={.kind=manual?WB_CMD_APPLY_CORE:WB_CMD_APPLY_RETURN,.argc=1};
+    strcpy(cmd.argv[0],nonce);int status=0;int rc=actual_handoff(&cmd,NULL,&status);inject_active=false;assert(rc==0);return status;
+}
+static void show(const char*name,int status){
+    printf("case=%s status=%d launches=%u private_phase=%u intent=%u stage_checks=%u\n",
+           name,status,launch_calls,phase(),files[1].exists?1u:0u,stage_calls);
+}
+int main(int argc,char**argv){
+    assert(argc==3);
+    if(strcmp(argv[1],"all")){
+        ready();mid_delay_us=2000000u;
+        if(!strcmp(argv[1],"teststat-2s"))inject_at=5;
+        else if(!strcmp(argv[1],"private-read-2s"))inject_at=6;
+        else assert(!strcmp(argv[1],"intergate-2s"));
+        int status=execute(false);show(argv[1],status);
+        if(!strcmp(argv[2],"pass"))assert(status==0&&launch_calls==1&&phase()==R1_DISPATCHED&&files[1].exists&&stage_calls==2);
+        else assert(status==1&&!launch_calls&&phase()==R1_ARMED&&!files[1].exists&&stage_calls==(inject_at==6?0u:1u));
+        return 0;
+    }
+    assert(!strcmp(argv[1],"all")&&!strcmp(argv[2],"pass"));unsigned cases=0;
+    for(int op=1;op<=6;op++){
+        ready();inject_at=op;mid_delay_us=2000000u;int status=execute(false);
+        assert(!status&&launch_calls==1&&helper_calls==1&&arm_calls==1&&sync_calls==1&&a.updater_accepted);
+        assert(phase()==R1_DISPATCHED&&files[1].exists&&stage_calls==2);++cases;
+    }
+    puts("PASS actual main APPLY_RETURN crosses 2s sync/arm/helper/fence/test-stat/private-read with one durable dispatch and launch");
+    const enum fault_mode faults[]={FD_FOCUS,FD_APP,FD_SYSTEM,FD_WALL_REWIND,FD_WALL_JUMP,FD_MONO_SKEW,
+       FD_POWER,FD_CALLBACK,FD_SELECT,FD_START,FD_BAD_STAGE,FD_MONO_REWIND,FD_WALL_STOP,
+       FD_RTC_ERR,FD_APP_ERR,FD_POWER_WRAP,FD_LATCHED};
+    for(int op=1;op<=6;op++)for(unsigned k=0;k<sizeof faults/sizeof faults[0];k++){
+        ready();inject_at=op;mid_delay_us=2000000u;mid_fault=faults[k];int status=execute(false);
+        assert(status==1&&launch_calls==0&&phase()==R1_ARMED&&!files[1].exists&&!a.updater_accepted);++cases;
+    }
+    /* 01.91: the pad becoming unreadable is UNKNOWN, not a press, so the same
+       dispatch now completes at every injection point; an observed
+       Start/Select and every power/clock veto above still refuse. */
+    for(int op=1;op<=6;op++){
+        ready();inject_at=op;mid_delay_us=2000000u;mid_fault=FD_INPUT;int status=execute(false);
+        if(!(status==0&&launch_calls==1&&phase()==R1_DISPATCHED&&files[1].exists)){
+            show_log=true;
+            fprintf(stderr,"FD_INPUT op=%d status=%d launches=%u phase=%u private=%u stage=%u pads=%u bad=%d dis=%d gen=%u/%u\n",
+                    op,status,launch_calls,phase(),files[1].exists?1u:0u,stage_calls,pads,bad_input?1:0,
+                    standing_disabled_this_run?1:0,(unsigned)a.power_calls,(unsigned)standing_power_gen);
+            dump_log();
+        }
+        assert(status==0&&launch_calls==1&&phase()==R1_DISPATCHED&&files[1].exists);++cases;
+    }
+    puts("01.91 PASS unreadable pad no longer blocks the handoff bracket");
+    for(int op=1;op<=6;op++){
+        ready();inject_at=op;mid_delay_us=10001000u;assert(execute(false)==1&&!launch_calls&&phase()==R1_ARMED&&!files[1].exists);++cases;
+    }
+    ready();wrong_pin=true;assert(execute(false)==1&&!launch_calls&&phase()==R1_ARMED&&!files[1].exists);++cases;
+    ready();wrong_run=true;assert(execute(false)==1&&!launch_calls&&phase()==R1_ARMED&&!files[1].exists);++cases;
+    ready();helper_fail=1;assert(execute(false)==1&&!launch_calls&&phase()==R1_ARMED&&!files[1].exists);++cases;
+    ready();fence_fail=1;assert(execute(false)==1&&!launch_calls&&phase()==R1_ARMED&&!files[1].exists);++cases;
+    for(unsigned i=0;i<8;i++){
+        ready();int *gate[]={&g_ssh.authenticated,&g_ssh.mode.accepted,&g_ssh.mode.mode,&g_ssh.session,
+          &g_ssh.channel,&g_ssh.shell,&g_ssh.shell_pty,&g_ssh.sftp_ro};
+        *gate[i]=i==7;assert(execute(false)==1&&!launch_calls&&stage_calls==0&&phase()==R1_ARMED);++cases;
+    }
+    ready();a.rtc_last=wall-1500001u;assert(execute(false)==1&&!launch_calls&&stage_calls==0);++cases;
+    ready();r1_signed_begin=NULL;assert(execute(false)==1&&!launch_calls&&stage_calls==0);++cases;
+    ready();r1_signed_end=NULL;assert(execute(false)==1&&!launch_calls&&stage_calls==0);++cases;
+    ready();nonce[0]='0';assert(execute(false)==1&&!launch_calls&&stage_calls==1&&phase()==R1_ARMED);++cases;
+    puts("PASS actual main handoff refuses overlay, counters, clocks, power, callbacks, input/veto, changed receipt/pins/run, budget and I/O guards");
+    ready();fault_mode=FD_TWO_REPEATED;mid_delay_us=7000000u;int status=execute(false);show("total-11s",status);
+    assert(status==1&&!launch_calls&&phase()==0&&!files[1].exists&&!a.updater_accepted);++cases;
+    ready();fault_mode=FD_TWO_REPEATED;mid_delay_us=6000000u;status=execute(false);show("total-10s",status);
+    assert(status==0&&launch_calls==1&&phase()==R1_DISPATCHED&&files[1].exists);++cases;
+    ready();late_power=true;assert(execute(false)==1&&!launch_calls&&phase()==0&&!files[1].exists);++cases;
+    ready();late_skew=true;assert(execute(false)==1&&!launch_calls&&phase()==0&&!files[1].exists);++cases;
+    ready();late_power=late_cancel_fail=true;assert(execute(false)==1&&!launch_calls&&!a.updater_accepted&&strstr(output,"cancel-failed"));++cases;
+    puts("PASS total transaction limit and post-dispatch save faults stop before updater launch and revoke when storage permits");
+    ready();assert(execute(true)==0&&launch_calls==1&&phase()==0&&!files[1].exists&&a.updater_accepted);++cases;
+    ready();assert(r1_revoke()==WB_OK&&r1_issue_local(stage)==WB_OK);
+    r1_local local={0};assert(r1_get(R1_LOCAL_PATH,&local,sizeof local));strcpy(nonce,local.t.nonce);
+    stage_calls=0;mid_delay_us=2000000u;
+    assert(!r1_signed_armed&&execute(false)==0&&launch_calls==1&&phase()==R1_DISPATCHED&&files[1].exists&&stage_calls==3);++cases;
+    printf("PASS %u full-handoff cases (actual production switch/R1/focus, SDK/storage stubs; no Vita)\n",cases);
+    return 0;
+}

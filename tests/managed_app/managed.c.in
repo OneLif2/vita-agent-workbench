@@ -1,0 +1,76 @@
+static char token[65],commit[144];
+static wb_shell_channel test_ch;
+static void paired_pty(void){
+ memset(&g_ssh,0,sizeof g_ssh);g_ssh.authenticated=true;g_ssh.mode.accepted=true;g_ssh.mode.mode=MODE_B_KEY;
+ g_ssh.session=(void *)&test_ch;g_ssh.channel=(void *)&test_ch;g_ssh.shell=&test_ch;g_ssh.shell_pty=true;
+}
+static void reset_all(void){reset(0);paired_pty();cal=4;clock_us=31337000;system_shadow=0;wb_vita_forget_remove_plan();memcpy(sfo,original,sizeof sfo);}
+static void plan(void){
+ trial("app uninstall-plan INAP00020","app uninstall-plan title=INAP00020 app_ver=01.01");
+ char *p=strstr(output," token=");assert(p&&strlen(p+7)==65);memcpy(token,p+7,64);token[64]=0;assert(wb_remove_hex(token));snprintf(commit,sizeof commit,"app uninstall INAP00020 %s",token);
+ assert(strstr(output,EXPECTED_SFO)&&strstr(output,EXPECTED_BOOT));assert(!deletes);
+}
+typedef struct {const char *in;size_t pos,used;char out[8192];} managed_pipe;
+static int pipe_read(void *ctx,uint8_t *p,size_t n){managed_pipe *s=ctx;size_t left=strlen(s->in)-s->pos;if(!left)return -2;if(n>left)n=left;memcpy(p,s->in+s->pos,n);s->pos+=n;return (int)n;}
+static int pipe_write(void *ctx,const uint8_t *p,size_t n){managed_pipe *s=ctx;assert(s->used+n<sizeof s->out);memcpy(s->out+s->used,p,n);s->used+=n;s->out[s->used]=0;return (int)n;}
+static void channel_negative(void){
+ /* A real no-PTY shell still parses valid command lines; verify that its adapter
+  * cannot inspect/plan/commit, even if piped a syntactically valid prior token. */
+ reset_all();plan();char pipe_req[512];snprintf(pipe_req,sizeof pipe_req,"app status INAP00020\rapp uninstall-plan INAP00020\r%s\rexit\r",commit);
+ managed_pipe st={.in=pipe_req};wb_shell_ops ops={.core_exec=core};unsigned ac=0;
+ g_ssh.shell_pty=false;assert(wb_sh_start(g_ssh.shell,false)==0);
+ for(int i=0;i<1000;i++){int r=wb_sh_pump(g_ssh.shell,&st,pipe_read,pipe_write,&ops,&ac);assert(r>=0);if(!r)break;}
+ const char *p=st.out;int count=0;while((p=strstr(p,"ERR paired interactive PTY required"))){p++;count++;}
+ assert(count==3&&deletes==0);assert(!strstr(st.out,"state=installed")&&!strstr(st.out," token="));
+ for(int i=0;i<7;i++){
+   paired_pty();switch(i){case 0:g_ssh.authenticated=false;break;case 1:g_ssh.mode.accepted=false;break;
+    case 2:g_ssh.mode.mode=MODE_NONE;break;case 3:g_ssh.session=NULL;break;case 4:g_ssh.channel=NULL;break;
+    case 5:g_ssh.shell=NULL;break;default:g_ssh.sftp_ro=(void*)&test_ch;break;}
+   trial("app status INAP00020","ERR paired interactive PTY required");trial("app uninstall-plan INAP00020","ERR paired interactive PTY required");
+   trial(commit,"ERR paired interactive PTY required");assert(!deletes);
+ }
+ puts("PASS negotiated channel: piped authenticated no-PTY shell denies status/plan/commit, even with a valid token; auth, shell/channel ownership and non-SFTP gates deny all three.");
+}
+static void native_bad(const char*id){
+ wb_out o={NULL,emit};int st=0;used=0;output[0]=0;
+ wb_vita_managed_app_command(id,2,"0000000000000000000000000000000000000000000000000000000000000000",a.run_hex,&o,&st);
+ assert(st==1&&!deletes&&!loaded&&!init_loaded);
+}
+int main(int argc,char**argv){
+ (void)argc;(void)argv;
+ file("sfo",original,sizeof original);file("boot",boot,sizeof boot);
+ reset_all();
+ trial("app status INAP00020","state=installed app_ver=01.01");plan();printf("plan identified: INAP00020 01.01 original SFO/eboot; issued=0\n");
+ trial(commit,"OK app-uninstall title=INAP00020 state=absent");assert(deletes==1&&!has&&!registered);
+ trial("app status INAP00020","state=absent");trial(commit,"phase=token");printf("delete calls=%d disk=%d registry=%d replay=refused\n",deletes,has,registered);
+ if(argc>1)return 0;
+ channel_negative();
+ const char *deny[]={"INAP00018","INAP00019","NPXS10000","NPXS10015","WBCZ00000","VITASHELL","MLCL00001","PCSG90096","SKGD3PL0Y","VSSH00001","../../etc","inap00020","ux0:/app/INAP00020","INAP00020*"};
+ for(unsigned i=0;i<sizeof deny/sizeof *deny;i++){reset_all();native_bad(deny[i]);char cmd[160];snprintf(cmd,sizeof cmd,"app uninstall-plan %s",deny[i]);trial(cmd,"ERR");assert(!deletes&&!cmds);}
+ reset_all();trial("app uninstall INAP00020","ERR");assert(!deletes&&!cmds);
+ reset_all();plan();wb_vita_forget_remove_plan();trial(commit,"phase=token");assert(!deletes);
+ reset_all();plan();clock_us+=120001000ULL;trial(commit,"phase=token");assert(!deletes);
+ reset_all();plan();clock_us--;clock_us-=1000;trial(commit,"phase=token");assert(!deletes);
+ reset_all();plan();boot[3]^=1;trial(commit,"phase=identity-changed");boot[3]^=1;trial(commit,"phase=token");assert(!deletes);
+ reset_all();plan();char first[144];strcpy(first,commit);plan();assert(strcmp(first,commit));trial(first,"phase=token");assert(!deletes);
+ reset_all();plan();snprintf(first,sizeof first,"app uninstall ABCD00001 %s",token);trial(first,"phase=token");assert(!deletes);
+ reset_all();system_shadow=1;trial("app uninstall-plan INAP00020","phase=system-path");assert(!deletes);
+ reset_all();system_shadow=-1;trial("app uninstall-plan INAP00020","phase=system-path");assert(!deletes);
+ reset_all();wb_sfo fs;assert(wb_sfo_parse(&fs,sfo,sizeof sfo)==WB_OK);
+ for(size_t i=0;i+3<=sizeof sfo;i++)if(!memcmp(sfo+i,"gd",3)){sfo[i]='s';sfo[i+1]='d';break;}
+ trial("app uninstall-plan INAP00020","phase=sfo-identity");assert(!deletes);
+ reset_all();for(size_t i=0;i+10<=sizeof sfo;i++)if(!memcmp(sfo+i,TESTID,10)){sfo[i]='Z';break;}
+ trial("app uninstall-plan INAP00020","phase=sfo-identity");assert(!deletes);
+ for(int f=PAF;f<=BOOT_TYPE;f++){
+   if(f==WRONG_BOOT)continue; /* mismatched content is tested between plan and commit */
+   reset_all();plan();fault=f;trial(commit,"ERR app-uninstall-gate");bool issued=(f>=DELETE_FAIL&&f<=PAF_ERR);
+   assert(deletes==(int)issued);assert(strstr(output,issued?"issued=1":"issued=0"));trial(commit,"phase=token");assert(deletes==(int)issued);
+ }
+ /* A second eligible title must work via the same source without compiling another allowlist. */
+ reset_all();for(size_t i=0;i+10<=sizeof sfo;i++)if(!memcmp(sfo+i,TESTID,10)){memcpy(sfo+i,"ABCD00001",9);break;}
+ alt=1;trial("app uninstall-plan ABCD00001","app uninstall-plan title=ABCD00001");char *p=strstr(output," token=");assert(p);memcpy(token,p+7,64);token[64]=0;
+ snprintf(commit,sizeof commit,"app uninstall ABCD00001 %s",token);trial(commit,"OK app-uninstall title=ABCD00001 state=absent");assert(deletes==1);
+ wb_cmd raw;assert(!wb_cmd_parse(commit,strlen(commit),&raw)||raw.kind!=WB_CMD_TERM_USER_REMOVE);
+ puts("PASS managed_app: positive TestApp and arbitrary eligible generated title; protected IDs and loads, expiry, shell change, mutation, stale/wrong token, shadow/error mount, SFO category/id, post-delete and cleanup failures, replay, no raw exec.");
+ return 0;
+}

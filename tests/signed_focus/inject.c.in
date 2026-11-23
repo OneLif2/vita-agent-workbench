@@ -1,0 +1,35 @@
+enum fault_mode {FD_NONE,FD_TWO,FD_FOCUS,FD_APP,FD_SYSTEM,FD_WALL_REWIND,FD_WALL_JUMP,FD_MONO_SKEW,FD_OVER_BUDGET,
+    FD_POWER,FD_CALLBACK,FD_INPUT,FD_SELECT,FD_START,FD_BAD_STAGE,FD_MONO_REWIND,FD_WALL_STOP,FD_RTC_ERR,
+    FD_APP_ERR,FD_POWER_WRAP,FD_LATCHED,FD_TWO_REPEATED};
+static enum fault_mode fault_mode;
+static unsigned stage_calls;
+static int queued_core_check(void){
+    ++stage_calls;
+    enum fault_mode v=fault_mode;
+    if(v!=FD_TWO_REPEATED)fault_mode=FD_NONE;
+    if(v==FD_NONE)return healthy_stage?WB_OK:WB_E_STATE;
+    wall+=2000000u;mono+=2000u;
+    switch(v){
+        case FD_FOCUS:has_fg=false;break;
+        case FD_APP:++fg_app;break;
+        case FD_SYSTEM:++fg_system;break;
+        case FD_WALL_REWIND:wall-=2000001u;break;
+        case FD_WALL_JUMP:wall+=200001u;break;
+        case FD_MONO_SKEW:mono+=201u;break;
+        case FD_OVER_BUDGET:mono+=8001u;wall+=8001000u;break;
+        case FD_POWER:++a.power_calls;break;
+        case FD_CALLBACK:fg_callback=1;break;
+        case FD_INPUT:bad_input=true;break;
+        case FD_SELECT:pads=SCE_CTRL_SELECT;break;
+        case FD_START:pads=SCE_CTRL_START;break;
+        case FD_BAD_STAGE:stage[11]='a';break;
+        case FD_MONO_REWIND:mono-=2001u;break;
+        case FD_WALL_STOP:wall-=2000000u;break;
+        case FD_RTC_ERR:fg_rtc_rc=-1;break;
+        case FD_APP_ERR:fg_app_rc=-1;break;
+        case FD_POWER_WRAP:fg_power=0x1080u;break;
+        case FD_LATCHED:fg_latched=true;break;
+        default:break;
+    }
+    return healthy_stage?WB_OK:WB_E_STATE;
+}

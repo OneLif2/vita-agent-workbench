@@ -1,0 +1,10 @@
+# Owner-maintained LOCAL approvals. No inline comments, wildcards, duplicate
+# title/version pairs, automatic enrollment, or URL-based updates.
+# TITLE_ID APP_VER SHA256 case[,case...]
+# "-" explicitly authorizes installation only: no test case and no launch.
+VSSH00001 01.42 e6363e629be55ab65151456989095310f9c0d2177bc4685a655041e1ea4758ce -
+INAP00020 01.01 fea70dc69399200bdf00ca145044cac7725b4987d19da9d032ff2dbfd12a43e9 fs-smoke,power-smoke,compute-smoke
+WBPA00077 01.77 caa2fc46faec834e92b318fd5f03dabcd11997905f75b396c69fb00a316d5eec -
+WBSD00078 01.00 368a2031d22a6c16a17f062b87e46055a1a9e36f808574c20cc9a0b558d5e697 -
+WBLC00079 01.02 026389c85760b79921a0b587eefed0daaedf22e108a4b915c2375c26a1534621 -
+RJGM52237 01.01 b3a8fbb2ddf112df4da2d3f2848d9fe865e2d78b268db4a22d6577c4bb257baa -

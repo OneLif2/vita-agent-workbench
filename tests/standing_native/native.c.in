@@ -1,0 +1,139 @@
+
+static void begin(void) {
+    reset();standing_disabled_this_run=false;r1_signed_armed=false;r1_signed_begin=NULL;r1_signed_end=NULL;
+    fail_standing=lie_standing=unknown_standing=read_standing=false;
+    corrupt_signature=signature_power=false;has_fg=has_audit=true;tried_signatures=0;
+    pads=0;bad_input=false;
+    pw_ac=1;pw_suspend=pw_low=0;overlay_reads=0;
+    a.power_event=0;a.power_latched=false;
+    a.rtc_last=wall;fg_app=fg_system=fg_power=0;fg_latched=false;
+    fg_callback=fg_app_rc=fg_rtc_rc=0;
+    a.power_calls=1;
+    g_ssh.authenticated=g_ssh.mode.accepted=g_ssh.session=g_ssh.channel=g_ssh.shell=g_ssh.shell_pty=1;
+    g_ssh.mode.mode=MODE_B_KEY;g_ssh.sftp_ro=0;
+    active_version="01.84";
+}
+static wb_r1_ticket sample_boot(const char *source) {
+    active_version=source;a.run_hex=oldrun;
+    snprintf(stage,sizeof stage,"WBQ2 01.84 %064x 2474320\n",13);
+    assert(r1_issue_local(stage)==WB_OK);
+    r1_local l;assert(r1_get(R1_LOCAL_PATH,&l,sizeof l));
+    assert(r1_apply(l.t.nonce,true)==WB_OK);
+    boot_env();active_version="01.84";strcpy(installed,stage);
+    wb_r1_ticket ret={0};assert(r1_boot(&ret));assert(r1_get(R1_LOCAL_PATH,&l,sizeof l)&&l.phase==0);return ret;
+}
+static void next_stage(const char *v) {
+    assert(r1_revoke()==WB_OK);
+    snprintf(stage,sizeof stage,"WBQ2 %s %064x 2440000\n",v,912);
+}
+static void current_state(const char *v) {
+    int status=11;wb_cmd cmd={0};
+    assert(!wb_standing_status(&cmd,NULL,&status)&&status==0&&strstr(output,v));
+}
+static int request(void) {
+    int status=11;wb_cmd c={.argc=2};
+    memset(c.argv[0],'a',64);memset(c.argv[1],'b',64);
+    assert(!wb_standing_issue(&c,NULL,&status));return status;
+}
+static void reject(const char *what) {assert(request()==1&&strstr(output,what));}
+static void accepted(void) {
+    assert(request()==0&&strstr(output,"OK r1-signed target=")&&r1_signed_armed);
+    r1_local l;assert(r1_get(R1_LOCAL_PATH,&l,sizeof l));strcpy(nonce,l.t.nonce);
+    assert(!r1_status(NULL)&&strstr(output,"state=authorized")&&strstr(output,nonce));
+    assert(!files[1].exists&&!files[2].exists); /* arm does not apply */
+}
+static void enroll(void) {
+    begin();wb_r1_ticket accepted=sample_boot("01.82");wb_standing_bootstrap(&accepted);
+    current_state("state=enabled");
+    next_stage("01.85");
+}
+int main(void) {
+    if(!WB_STANDING_BOOTSTRAP){
+        begin();wb_r1_ticket prev=sample_boot("01.82");
+        /* Use a genuinely valid old transition as a stronger off-switch
+           control, independent of the shipping SFO version comparison. */
+        wb_standing_bootstrap(&prev);assert(!files[3].exists);current_state("state=disabled");
+        active_version="01.85";wb_standing_bootstrap(&prev);
+        assert(!files[3].exists);current_state("state=disabled");
+        /* Seed only the fixture's 01.84-r2 savedata, as an existing profile
+           survives a genuine install. No shipping enrollment is exercised. */
+        wb_standing_disk saved={.magic="WBS1-01",.permit=WB_STANDING_ACTIVE};
+        memcpy(saved.key,wb_standing_key_id(),65);
+        memcpy(saved.host,prev.host_pin,65);memcpy(saved.owner,prev.owner_pin,65);
+        memcpy(saved.source_run,prev.source_run,17);memcpy(saved.nonce,prev.nonce,33);
+        assert(wb_standing_saved(&saved));current_state("state=enabled");
+        next_stage("01.86");accepted();assert(r1_apply(nonce,true)==WB_OK);
+        assert(wb_standing_veto());current_state("state=revoked");
+        standing_disabled_this_run=false;wb_standing_bootstrap(&prev);current_state("state=revoked");
+        puts("PASS shipping 01.85 forbids new or renewed enrollment; inherited 01.84 profile still supports a scoped signed grant");
+        return 0;
+    }
+    begin();current_state("state=disabled");reject("disabled");assert(!tried_signatures);
+    wb_cmd c;assert(!wb_cmd_parse("r1-signed a b",13,&c)&&!wb_cmd_parse("r1-auto-status",14,&c));
+    wb_r1_ticket empty={0};wb_standing_bootstrap(&empty);assert(!files[3].exists);
+    wb_r1_ticket valid=sample_boot("01.83");wb_standing_bootstrap(&valid);assert(!files[3].exists);
+    begin();valid=sample_boot("01.82");unknown_standing=true;wb_standing_bootstrap(&valid);assert(!files[3].exists);
+    unknown_standing=false;has_fg=false;wb_standing_bootstrap(&valid);assert(!files[3].exists);
+    has_fg=true;wb_standing_bootstrap(&valid);assert(files[3].exists);current_state("state=enabled");
+    assert(wb_standing_veto());current_state("state=revoked");
+    standing_disabled_this_run=false;wb_standing_bootstrap(&valid);current_state("state=revoked");
+    puts("PASS known bootstrap source, real R1 boot consume, pins, storage and irreversible local revoke");
+
+    for(unsigned i=0;i<8;i++){
+        enroll();int *gates[]={&g_ssh.authenticated,&g_ssh.mode.accepted,&g_ssh.mode.mode,&g_ssh.session,
+                             &g_ssh.channel,&g_ssh.shell,&g_ssh.shell_pty,&g_ssh.sftp_ro};
+        *gates[i]=i==7;reject("no-pty");assert(!tried_signatures);
+    }
+    enroll();a.pin=own;reject("disabled");assert(!tried_signatures);
+    enroll();a.user_pin=host;reject("disabled");assert(!tried_signatures);
+    enroll();read_standing=true;reject("disabled");
+    enroll();files[3].data[8]^=1;reject("disabled");
+    puts("PASS genuine paired interactive SSH only, current host/owner/key/storage");
+
+    enroll();has_fg=false;reject("stale-or-busy");assert(!tried_signatures);
+    enroll();corrupt_signature=true;reject("signature");assert(tried_signatures==1);
+    corrupt_signature=false;accepted();assert(r1_apply(nonce,false)==WB_OK);
+    assert(r1_apply(nonce,true)==WB_OK);assert(files[1].exists);assert(r1_apply(nonce,true)!=WB_OK);
+    next_stage("01.85");reject("stale-or-busy");
+    next_stage("01.86");accepted();assert(r1_apply(nonce,false)==WB_OK);++a.power_calls;assert(r1_apply(nonce,true)!=WB_OK);
+    next_stage("01.87");accepted();stage[11]='f';assert(r1_apply(nonce,true)!=WB_OK);
+    next_stage("01.88");accepted();assert(wb_standing_veto());assert(r1_apply(nonce,true)!=WB_OK);
+    enroll();accepted();pads=SCE_CTRL_SELECT;assert(r1_apply(nonce,true)!=WB_OK);current_state("state=revoked");
+    enroll();pads=SCE_CTRL_START;reject("stale-or-busy");assert(!tried_signatures);
+    /* 01.91: an unavailable pad read is UNKNOWN, never a press, so an
+       unattended bracket can be taken. Positive START/SELECT above still veto. */
+    enroll();bad_input=true;
+    {const int st=request();
+     if(st!=0||!strstr(output,"OK r1-signed target=")||tried_signatures!=1)
+         fprintf(stderr,"PAD-UNKNOWN status=%d tried=%u output=%s\n",st,tried_signatures,output);
+     assert(st==0&&strstr(output,"OK r1-signed target=")&&tried_signatures==1);}
+    puts("PASS 01.91 pad-unknown is not a veto while positive Start/Select still refuse");
+
+    /* 01.91 bounded settle. A registration/resume latch left standing because
+       the listener was busy is absorbed exactly once; a real supply change, an
+       unknown flag, low battery or a suspend request still refuses; an overlay
+       that clears by itself is waited out, one that persists is not. */
+    enroll();a.power_event=(uint32_t)(WB_AC_ONLINE|WB_AFTER_RESUME);a.power_latched=true;pw_ac=1;
+    assert(request()==0&&strstr(output,"OK r1-signed target="));
+    assert(!a.power_event&&!a.power_latched);
+    enroll();a.power_event=(uint32_t)(WB_AC_ONLINE|WB_AFTER_RESUME);a.power_latched=true;pw_ac=0;reject("stale-or-busy");
+    enroll();a.power_latched=true;assert(request()==0);                  /* zero-bit registration */
+    enroll();a.power_event=0x2000U;a.power_latched=true;reject("stale-or-busy"); /* unknown flag */
+    enroll();pw_low=1;reject("stale-or-busy");
+    enroll();pw_suspend=1;reject("stale-or-busy");
+    enroll();fg_app_rc=-1;reject("stale-or-busy");
+    enroll();fg_rtc_rc=-1;reject("stale-or-busy");
+    enroll();overlay_reads=3;assert(request()==0);                        /* overlay cleared */
+    enroll();has_fg=false;reject("stale-or-busy");                        /* overlay persisted */
+    puts("PASS 01.91 settle absorbs only a documented benign resume, never a real power change");
+    puts("PASS scoped signature, one shot across reset, exact queue and foreground/power revalidation");
+
+    enroll();signature_power=true;reject("stale-or-busy");assert(!r1_signed_armed);
+    enroll();fail_standing=true;reject("storage");assert(!r1_signed_armed);fail_standing=false;reject("disabled");
+    enroll();lie_standing=true;reject("storage");assert(!r1_signed_armed);
+    enroll();has_audit=false;reject("storage");assert(!r1_signed_armed);
+    enroll();fail_save=true;reject("grant");fail_save=false;reject("stale-or-busy");
+    enroll();accepted();fail_standing=true;assert(!wb_standing_veto());assert(r1_apply(nonce,true)!=WB_OK);
+    puts("PASS unknown signature/save/audit/revoke outcomes never yield unattended apply");
+    return 0;
+}

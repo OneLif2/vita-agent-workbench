@@ -1,0 +1,10 @@
+#ifndef WB_STANDING_PROVISION_H
+#define WB_STANDING_PROVISION_H
+/* EXAMPLE ONLY: generate your own public provisioning. Private keys never belong here.
+ * Remove this error only after replacing ALL slots and reviewing your local trust setup. */
+#error "Personal provisioning is intentionally not shipped; configure your own public keys first"
+#define WB_STANDING_HOST "HOST_SHA256"
+#define WB_STANDING_OWNER "OWNER_SHA256"
+#define WB_STANDING_SIGNER "SIGNER_SHA256"
+#define WB_STANDING_SEC1 "SEC1_PUBLIC_KEY"
+#endif

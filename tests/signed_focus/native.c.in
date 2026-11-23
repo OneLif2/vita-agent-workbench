@@ -1,0 +1,55 @@
+
+static void ready_to_apply(void){
+    fault_mode=FD_NONE;enroll();accepted();stage_calls=0;
+}
+static unsigned phase(void) {
+    r1_local s={0};assert(r1_get(R1_LOCAL_PATH,&s,sizeof s));return (unsigned)s.phase;
+}
+static void unwritten(void) {
+    assert(!files[1].exists&&!files[2].exists&&phase()==R1_ARMED);
+}
+int main(int argc,char **argv){
+    if(argc==2){
+        assert(!strcmp(argv[1],"2s"));
+        ready_to_apply();fault_mode=FD_TWO;
+        int q=r1_apply(nonce,false);
+        printf("r1_apply signed stage delay=2000000us rc=%d private_phase=%u intent=%u stage_checks=%u\n",
+               q,phase(),files[1].exists?1u:0u,stage_calls);
+        return 0;
+    }
+    ready_to_apply();
+    fault_mode=FD_TWO;assert(r1_apply(nonce,false)==WB_OK);unwritten();
+    fault_mode=FD_TWO;assert(r1_apply(nonce,true)==WB_OK);assert(phase()==R1_DISPATCHED&&files[1].exists);
+    assert(stage_calls==2&&a.rtc_last==wall);
+    puts("PASS real r1_apply uses bounded snapshots for both full signed hashes; coherent 2s is allowed, dispatch exactly once");
+    const enum fault_mode faults[]={FD_FOCUS,FD_APP,FD_SYSTEM,FD_WALL_REWIND,FD_WALL_JUMP,FD_MONO_SKEW,
+        FD_OVER_BUDGET,FD_POWER,FD_CALLBACK,FD_SELECT,FD_START,FD_BAD_STAGE,FD_MONO_REWIND,
+        FD_WALL_STOP,FD_RTC_ERR,FD_APP_ERR,FD_POWER_WRAP,FD_LATCHED};
+    for(unsigned i=0;i<sizeof faults/sizeof faults[0];++i){
+        ready_to_apply();const uint64_t base=a.rtc_last;
+        fault_mode=faults[i];assert(r1_apply(nonce,true)!=WB_OK);
+        unwritten();assert(a.rtc_last==base);
+        if(faults[i]==FD_SELECT)assert(wb_standing_revoked());
+    }
+    ready_to_apply();a.rtc_last=wall-1500001u;
+    assert(r1_apply(nonce,false)!=WB_OK&&stage_calls==0);unwritten();
+    ready_to_apply();has_fg=false;assert(r1_apply(nonce,false)!=WB_OK&&stage_calls==0);unwritten();
+    ready_to_apply();bad_input=true;assert(r1_apply(nonce,false)==WB_OK&&stage_calls>0);unwritten();
+    /* 01.91: the pad going unreadable mid-bracket is UNKNOWN, not a press, so
+     * an unattended dispatch is still allowed; FD_SELECT/FD_START above and
+     * FD_LATCHED/FD_POWER_WRAP here still refuse. */
+    ready_to_apply();fault_mode=FD_INPUT;assert(r1_apply(nonce,true)==WB_OK&&phase()==R1_DISPATCHED);
+    puts("01.91 PASS unreadable pad no longer voids a bracket while Start/Select, latch and supply still do");
+    puts("PASS strict entry and real overlay, counters, callback, power, clocks, budget, receipt, and SELECT/START disallow signed apply");
+    fault_mode=FD_NONE;enroll();stage_calls=0;fault_mode=FD_TWO_REPEATED;
+    accepted();assert(stage_calls==2);unwritten();
+    fault_mode=FD_NONE;enroll();fault_mode=FD_FOCUS;
+    reject("stale-or-busy");assert(!r1_signed_armed&&phase()==0&&!files[1].exists);
+    puts("PASS signed grant issuance brackets both of its hashes and never grants on a post-hash focus veto");
+    fault_mode=FD_NONE;begin();next_stage("01.85");
+    assert(r1_issue_local(stage)==WB_OK);
+    r1_local s={0};assert(r1_get(R1_LOCAL_PATH,&s,sizeof s));strcpy(nonce,s.t.nonce);
+    fault_mode=FD_TWO;assert(!r1_signed_armed&&r1_apply(nonce,true)==WB_OK&&phase()==R1_DISPATCHED);
+    puts("PASS manual physical grant route is unchanged");
+    return 0;
+}

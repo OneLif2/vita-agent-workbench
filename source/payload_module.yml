@@ -1,0 +1,11 @@
+# Module config for vita-elf-create -e.
+# Without this the tool falls back to the ELF entry point for module_start;
+# naming the entries explicitly is what VitaShell does for its user modules.
+workbench_payload:
+  attributes: 0
+  version:
+    major: 1
+    minor: 1
+  main:
+    start: module_start
+    stop: module_stop

@@ -1,0 +1,14 @@
+int main(int argc,char **argv) {
+    assert(argc==2);scenario=atoi(argv[1]);
+    assert(scenario>=0 && scenario<=5);
+    file("sfo",sfo,sizeof sfo);file("boot",boot,sizeof boot);
+    reset(scenario==5 ? WRONG_BOOT : 0); cal=4;
+    trial("app status VSSH00001",""); printf("before: %s",output);
+    if(!strcmp(output,"app title=VSSH00001 state=installed app_ver=01.42\n")) {
+        trial("app uninstall VSSH00001","");printf("delete: %s",output);
+        trial("app status VSSH00001","");printf("after: %s",output);
+    }
+    printf("fixture native delete calls=%d disk=%d registry=%d\n",deletes,has,registered);
+    printf("fixture releases=%u short_options=%u\n",releases,short_opts);
+    return 0;
+}

@@ -1,0 +1,75 @@
+#include <assert.h>
+#include <stdio.h>
+#include <string.h>
+#include "wb_shell_channel.h"
+#include "wb_err.h"
+#include "wb_ver.h"
+typedef struct {int channel;wb_shell_channel *shell;} wb_ssh;
+static struct { bool updater_accepted;unsigned guard_grace; } a;
+static wb_shell_channel ch;
+static const char *mode;
+static int rc,calls,revoked,removed,exits,writes,delays,drained=999,notes;
+static int now_ms(void){return 10;}
+static int wb_updater_launch(void){++calls;return rc;}
+static void startup_mark(const char *msg,int code){assert(!strcmp(msg,"UPDATER LAUNCH RC")&&code==rc);}
+static void r1_revoke(void){++revoked;}
+static void sceIoRemove(const char *p){(void)p;++removed;}
+#define WBQ_TEST "stub:fixture"
+static int queue(void *p,const char *b,size_t n) {
+    wb_shell_channel *q=p;assert(q->queued+n<sizeof q->pending);
+    memcpy(q->pending+q->queued,b,n);q->queued+=n;return 0;
+}
+#if !OLD
+static wb_ssh g_ssh;
+static int sftp_wr(void *ignored,const uint8_t *b,size_t n) {
+    (void)ignored;(void)b;++writes;
+    if(!strcmp(mode,"partial")&&n>10)return 10;
+    if(!strcmp(mode,"backpressure"))return 0;
+    if(!strcmp(mode,"lost-peer"))return -1;
+    return (int)n;
+}
+static void sceKernelDelayThread(unsigned us){assert(us==2000);++delays;}
+static void wb_handoff_note(const char *event,int n) {
+    assert(!strncmp(event,"core voluntary-exit",19));++notes;drained=n;
+}
+static void sceKernelExitProcess(int n){assert(n==0&&notes==1);++exits;}
+/* DRAIN */
+#endif
+static int apply(wb_out *out,int *status){
+    int detail=!strcmp(mode,"reused");bool selfcheck=false,unattended=true;
+/* LAUNCH */
+}
+static int tick(void){
+/* LOOP */
+    return 1;
+}
+int main(int argc,char **argv){
+    assert(argc==2);mode=argv[1];
+    rc=!strcmp(mode,"negative")?-7:0;
+    int status=0;
+    wb_out out={&ch,queue};
+    assert(apply(&out,&status)==0);
+    assert(calls==1&&revoked==(rc<0)&&removed==0);
+    assert((status!=0)==(rc<0));
+    assert((strstr(ch.pending,"ERR updater-launch")!=NULL)==(rc<0));
+    int reuse=!OLD&&!strcmp(mode,"reused");
+    assert((strstr(ch.pending,"OK updater installed")!=NULL)==(OLD||(rc>=0&&!reuse)));
+    assert((strstr(ch.pending,"OK updater reused (detail=1), launching INAP00019; ssh will drop")!=NULL)==reuse);
+    ch.incoming[0]='x';ch.incoming[1]='\n';ch.rn=2;
+#if !OLD
+    g_ssh.shell=&ch;g_ssh.channel=strcmp(mode,"no-channel")!=0;
+#endif
+    int keep=tick();
+    assert(calls==1&&!ch.ri&&ch.rn==2&&ch.incoming[0]=='x');
+    if(OLD||rc<0){assert(keep==1&&!exits&&!writes&&!notes&&!delays);}
+    else {
+        assert(keep==0&&exits==1&&notes==1);
+        if(!strcmp(mode,"backpressure"))assert(writes==12&&delays==12&&drained==WB_E_TIMEOUT);
+        else if(!strcmp(mode,"lost-peer"))assert(writes==1&&!delays&&drained==WB_E_IO);
+        else if(!strcmp(mode,"no-channel"))assert(!writes&&!delays&&drained==WB_E_IO);
+        else {assert(drained==WB_OK&&ch.queued==0);if(!strcmp(mode,"partial"))assert(writes>1);}
+    }
+    printf("launch_calls=%d status=%d revoked=%d exit_calls=%d drain=%d writes=%d extra_input=%zu\n",
+           calls,status,revoked,exits,drained,writes,ch.ri);
+    return 0;
+}

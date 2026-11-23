@@ -1,0 +1,29 @@
+/* Offline model of the documented argument shape, not Vita OS emulation.
+ * Reject a known-short allocation BEFORE touching its fields. In particular
+ * the baseline case never reads a result pointer past its four-byte buffer. */
+static unsigned releases, short_opts;
+static int scenario;
+#define MEM_ERR ((int)0x80022005u)
+static int platform_release(int id, size_t n, const void *args,
+                            const void *ptr,size_t cap) {
+    assert(id==(int)SCE_SYSMODULE_INTERNAL_PAF && !n && !args);
+    ++releases;
+    if(cap==4){++short_opts;return MEM_ERR;}
+    assert(cap!=(size_t)-1 && cap==sizeof(SceSysmoduleOpt) && ptr);
+    const SceSysmoduleOpt *opt=ptr;
+    assert(opt->flags==0 && opt->unused[0]==0 && opt->unused[1]==0 && opt->result);
+    *opt->result=0;
+    if(scenario==1)return MEM_ERR;
+    if(scenario==2)*opt->result=-121;
+    if(scenario==3){*opt->result=-121;return MEM_ERR;}
+    if(scenario==4&&releases==2)return MEM_ERR;
+    return 0;
+}
+#define unload_paf native_release
+#define sceSysmoduleUnloadModuleInternalWithArg(id,n,a,o) platform_release((id),(n),(a),(o),__builtin_object_size((o),1))
+#include "under_test.inc"
+#undef sceSysmoduleUnloadModuleInternalWithArg
+#undef unload_paf
+static int unload_paf(void) {
+    assert(loaded&&!mod_loaded);loaded=0;return native_release();
+}

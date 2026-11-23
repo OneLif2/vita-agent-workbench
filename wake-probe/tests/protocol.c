@@ -1,0 +1,6 @@
+#include "wake_probe_protocol.h"
+#include <assert.h>
+#include <stdio.h>
+int main(void){wp_job j={0};memcpy(j.magic,WP_JOB_MAGIC,8);j.version=1;j.bytes=128;memset(j.nonce,'A',32);memset(j.source_run,'B',16);memset(j.job_id,'j',32);j.issued_us=100;j.deadline_us=100+WP_JOB_TTL_US;j.boot_epoch_us=10000000;assert(wp_job_live(&j,100,j.boot_epoch_us));assert(!wp_job_live(&j,j.deadline_us,j.boot_epoch_us));assert(!wp_job_live(&j,99,j.boot_epoch_us));assert(wp_epoch_valid(j.boot_epoch_us,j.boot_epoch_us+WP_BOOT_TOLERANCE_US));assert(!wp_epoch_valid(j.boot_epoch_us,j.boot_epoch_us+WP_BOOT_TOLERANCE_US+1));wp_job good=j;
+for(unsigned i=0;i<7;i++){j=good;switch(i){case 0:j.reserved[0]=1;break;case 1:j.job_id[32]='x';break;case 2:j.nonce[0]='G';break;case 3:j.source_run[0]='b';break;case 4:j.deadline_us++;break;case 5:j.bytes--;break;case 6:j.magic[0]^=1;break;}assert(!wp_job_shape(&j));}
+j=good;wp_result r;wp_result_init(&r,&j);assert(!wp_result_matches(&r,&j));r.stage=WP_STAGE_VALIDATED;assert(wp_result_matches(&r,&j));r.reserved_tail[51]=1;assert(!wp_result_matches(&r,&j));r.reserved_tail[51]=0;r.tick_count=25;assert(!wp_result_matches(&r,&j));r.tick_count=24;assert(wp_result_matches(&r,&j));puts("PASS protocol boundaries: ID32, fixed identity/size/reserved, nonce/run, deadline/epoch, stage/count; no authority");return 0;}
