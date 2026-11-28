@@ -114,10 +114,13 @@ int main(void){
     feed("tree-mkdir \"ux0:/VITA-POC/OK file.bin\"\n");expect("TTY1 ERR destination-exists");
     put_begin(0,"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");expect("TTY1 READY PUT 0");
     feed("END\n");expect("TTY1 OK PUT 0 e3b0c442");available=false;
-    put_begin(201326593,sha);expect("TTY1 ERR bad-size");
+    /* Above the removed 192MiB quota reaches the real storage adapter. */
+    put_begin(201326593,sha);expect("TTY1 ERR no-space");
+    put_begin((size_t)UINT32_MAX,sha);expect("TTY1 ERR no-space");
+    snprintf(cmd,sizeof cmd,"put \"%s\" 4294967296 sha256=%s\r",valid_path,sha);feed(cmd);expect("TTY1 ERR bad-size");
     put_begin(5,"dead");expect("TTY1 ERR bad-sha256");put_begin(9000,sha);expect("TTY1 ERR no-space");assert(!opened);
     available=true;size=0;feed("get \"ux0:/VITA-POC/OK file.bin\"\n");expect("TTY1 READY GET 0");feed("END\n");expect("TTY1 OK GET 0 e3b0c44298fc1c149afbf4c8996fb924");
     feed("get \"ux0:/VITA-POC/OK file.bin\"\n");grow=true;feed("END\n");expect("TTY1 ERR size-changed");assert(!opened);
-    puts("PASS PTY requirement, protected path, quota, digest syntax, destination refusal; empty GET and file-growth denial");
+    puts("PASS PTY requirement, protected path, uint32 wire ceiling, digest syntax, destination refusal; empty GET and file-growth denial");
     return 0;
 }

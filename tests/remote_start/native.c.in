@@ -81,6 +81,12 @@ static void ui_refresh(const char*p,const char*s){assert(!p&&s);}
 #define SCE_KERNEL_POWER_TICK_DISABLE_AUTO_SUSPEND 1
 static int sceKernelPowerTick(int x){assert(x==1);ticks++;return 0;}
 static void absorb_focus(void){}
+/* Admission/guard fixture only. Actual 15-minute timer/native-call coverage
+ * lives in tests/idle_screen; never mistake this stub for screen-lock proof. */
+static struct {bool off;} idle_screen;
+static void idle_screen_poll(uint64_t mono,bool input,const SceCtrlData *pad){
+ (void)mono;(void)input;(void)pad;
+}
 ACTUAL_ADMISSION
 static bool runtime(int mode){
  const char*reason=NULL;bool owner_exit_from_listener=false;
@@ -101,7 +107,7 @@ ACTUAL_RUNTIME_GUARD
  (void)owner_exit_from_listener;
  return reason==NULL;
 }
-static void reset(void){memset(&m,0,sizeof m);memset(&a,0,sizeof a);memset(&g_ssh,0,sizeof g_ssh);m.pad_rc=m.identity=m.owner_match=m.host_match=m.enabled=m.import_ok=m.net_ok=m.ret_valid=m.log_ok=1;m.strict=1;m.overlay=1;m.power=0x1080;waits=power_drains=prompts=binds=prepares=logs=audit_ok=audit_error=0;enroll_allowed=-1;revokes=standing_revokes=optouts=ticks=0;fake_ms=0;}
+static void reset(void){memset(&m,0,sizeof m);memset(&a,0,sizeof a);memset(&g_ssh,0,sizeof g_ssh);memset(&idle_screen,0,sizeof idle_screen);m.pad_rc=m.identity=m.owner_match=m.host_match=m.enabled=m.import_ok=m.net_ok=m.ret_valid=m.log_ok=1;m.strict=1;m.overlay=1;m.power=0x1080;waits=power_drains=prompts=binds=prepares=logs=audit_ok=audit_error=0;enroll_allowed=-1;revokes=standing_revokes=optouts=ticks=0;fake_ms=0;}
 static void one(const char*name,bool allow){
  const char*why=boot();
  if((why==NULL)!=allow){fprintf(stderr,"%s unexpected why=%s bind=%d\n",name,why?why:"none",binds);assert(0);}

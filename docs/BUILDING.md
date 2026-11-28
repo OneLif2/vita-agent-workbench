@@ -1,40 +1,14 @@
 # Building and configuration boundaries
 
-This is a source-only research export. External toolchains/dependencies and local
-trust configuration are deliberately not bundled; an unconfigured native build
-is expected to stop, not silently enroll a key or disable checks.
+This is a source-only export of `psvita-agent-terminal` (reference `02.21`). External toolchains/dependencies and local trust configuration are deliberately not bundled; an unconfigured native build is expected to fail closed rather than silently enrolling a key or disabling checks.
 
-1. Obtain VitaSDK, libssh 0.12.2-compatible headers/server archive, matching Mbed TLS
-   and the project's Vita Mbed TLS platform object. These dependencies need their
-   own upstream build instructions; no SDK installer is run by this repository.
-2. Review `source/wb_standing_provision.h.example`. Generate your own public host,
-   owner and release-signer provisioning, then create the ignored actual header.
-   Never copy another owner's pins or commit any private key. Public host-tool
-   slots must also be configured locally; invalid slots intentionally fail checks.
-3. Review `tools/apps.txt` as reference approvals, not a bundle of installable apps.
-   Build/approve your own artifacts and regenerate the registry with
-   `tools/gen_app_registry.py`. No third-party VPK is supplied.
-4. Rebuild the fixed-game library from `runtime/`; see its README. Put the resulting
-   local `libwbgame.a` in `source/`. The precompiled archive is intentionally omitted.
-5. In `source/`, set `VITASDK`, `VITA_PLATFORM_OBJECT`, `LIBSSH_INCLUDE`,
-   `LIBSSH_INCLUDE2`, `LIBSSH_ARCHIVE`, `MBED_INCLUDE` and `MBED_LIB`, then review
-   `build.sh` before invoking `sh build.sh build`.
+1. Obtain VitaSDK, `libssh 0.12.2`-compatible headers/server archive, matching Mbed TLS (`3.6.x`), and the Vita Mbed TLS platform object.
+   - **Performance note (`02.21`):** Build `libssh.a` and `libmbedcrypto.a` with `-O3 -mcpu=cortex-a9 -mtune=cortex-a9 -mfpu=neon -mfloat-abi=hard -DNDEBUG -fno-pic -fno-pie` (with `-DMAX_BUF_SIZE=65536 -DWITH_DEBUG_CALLTRACE=OFF -DWITH_PCAP=OFF` for `libssh`, ensuring `-fPIC` is not emitted so `vita-elf-create` accepts all ARM relocations). Compiling `libssh.a` at default `-O0` significantly caps SFTP throughput.
+2. Review `source/wb_standing_provision.h.example`. Generate your own public host, owner, and release-signer provisioning, then create the ignored `source/wb_standing_provision.h`. Never commit any private key. Update local `192.0.2.x` documentation addresses and `HOST_SHA256` slots in your local config.
+3. Review `tools/apps.txt` as reference approvals and regenerate the compiled registry with `tools/gen_app_registry.py`.
+4. Rebuild the fixed-game library from `runtime/`; see `runtime/README.md`. Place the resulting `libwbgame.a` in `source/`.
+5. In `source/`, set `VITASDK`, `VITA_PLATFORM_OBJECT`, `LIBSSH_INCLUDE`, `LIBSSH_INCLUDE2`, `LIBSSH_ARCHIVE`, `MBED_INCLUDE`, and `MBED_LIB`, then run `sh build.sh build`.
 
-The original release coordinator depended on private input manifests and sibling
-version trees; it is not included as a reusable public deployment pipeline. Do
-not fake successful manifests or skip native title/path/hash/R1 checks to build.
-Further public-build portability work is pending; no fresh generic native build
-or new-device pairing acceptance is claimed for this export.
+## Frozen helper/payload inputs
 
-## Additional frozen inputs: packaging is intentionally incomplete
-
-The steps above describe prerequisites, not a complete runnable public build.
-`source/verify_helper_epoch.py` also requires the approved epoch-0174
-`manifest.json`, `eboot.bin` and `param.sfo`; `source/build.sh` requires the exact
-approved `payload/release_0122_p2_1.suprx`. These frozen binary/input records are
-not included in this source-only publication. Sources for the updater and payload
-are present, but a new rebuild does not automatically reproduce an approved hash.
-The approved-input guards will stop packaging. Do not bypass them or fabricate
-manifests: a reviewed, reproducible public helper/payload release workflow is
-pending. Private LAN defaults are replaced with TEST-NET documentation addresses;
-they are not reachable device configuration.
+`source/verify_helper_epoch.py` expects the approved updater epoch `01.74` (`manifest.json`, `eboot.bin`, `param.sfo`) and `source/build.sh` expects the approved `payload/release_0122_p2_1.suprx`. Those binary records are omitted from this source-only repository (sources for both updater and payload are included in `updater/` and `payload/`).

@@ -23,26 +23,42 @@ def text_command(c):
         return c
     raise t.Refused('not an admitted wbctl terminal operation')
 
-def exchange(cmd,timeout,stdin_bytes):
+def exchange(cmd,timeout,stdin_bytes,progress_total=None):
     try:
-        t.require(isinstance(cmd,str) and len(cmd)<512 and math.isfinite(timeout) and 0<timeout<=600,'invalid PTY request')
-        upload=re.fullmatch(r'put ('+IN+r') ([1-9]\d{0,8}) sha256=('+HEX+')',cmd)
+        t.require(isinstance(cmd,str) and len(cmd)<512 and math.isfinite(timeout) and timeout>0,'invalid PTY request')
+        if progress_total is not None:
+            t.require(type(progress_total) is int and 0<progress_total<=t.LIMIT,'invalid progress total')
+        upload=re.fullmatch(r'put ('+IN+r') ([1-9]\d{0,9}) sha256=('+HEX+')',cmd)
+        t.require(timeout<=600 or upload or cmd.startswith('app-install '),'invalid PTY request timeout')
         diag=DIAG.get(cmd)
         if upload:
             remote,size,sha=upload[1],int(upload[2]),upload[3]
             t.quoted_path(remote)
-            t.require(isinstance(stdin_bytes,bytes) and len(stdin_bytes)==size<=t.LIMIT and t.digest(stdin_bytes)==sha,'upload bytes differ from request')
+            t.require(size<=t.LIMIT,'upload exceeds Vita uint32 file limit')
+            if isinstance(stdin_bytes,t.wb_tree.FileSource):
+                t.require((stdin_bytes.size,stdin_bytes.sha256)==(size,sha),'upload snapshot differs from request')
+                with t.wb_tree.checked_open(stdin_bytes.path,stdin_bytes.sig) as file:
+                    t.require(t.wb_tree.file_digest(file,size)==sha,'upload bytes differ from request')
+            else:
+                t.require(isinstance(stdin_bytes,bytes) and len(stdin_bytes)==size and t.digest(stdin_bytes)==sha,'upload bytes differ from request')
         elif stdin_bytes is not None:
             raise t.Refused('unexpected stdin')
         elif not diag:
             wire=text_command(cmd)
         with t.paired_terminal() as term:
-            term.deadline=min(term.deadline,time.monotonic()+timeout)
+            if progress_total is not None:
+                term.install_total=progress_total
+            term.deadline=(time.monotonic()+timeout if upload or cmd.startswith('app-install ')
+                           else min(term.deadline,time.monotonic()+timeout))
             if upload:
-                # Source is the exact byte snapshot validated above (local temporary file only).
-                with tempfile.TemporaryDirectory() as tmp:
-                    p=Path(tmp)/'input';p.write_bytes(stdin_bytes)
-                    r=term.push(p,remote)
+                if isinstance(stdin_bytes,t.wb_tree.FileSource):
+                    # The caller retains this private snapshot context until receipt.
+                    r=term.push(stdin_bytes,remote)
+                else:
+                    # Compatibility only for existing bounded small CORE/Photos callers.
+                    with tempfile.TemporaryDirectory() as tmp:
+                        p=Path(tmp)/'input';p.write_bytes(stdin_bytes)
+                        r=term.push(p,remote)
                 t.require(r['sha256']==sha and r['bytes']==size and r['remote']==remote,'invalid published receipt')
                 return 0,f'OK put path={remote} bytes={size} sha256={sha}'
             if diag:
@@ -64,6 +80,7 @@ def exchange(cmd,timeout,stdin_bytes):
     except (t.pin.PairError,t.TrustRefused) as e:return 78,'ERR SSH trust: '+str(e)
     except (socket.timeout,TimeoutError):return 124,'TIMEOUT waiting for terminal receipt'
     except t.Refused as e:return 1,'ERR terminal: '+str(e)
+    except t.wb_tree.TreeError as e:return 1,'ERR local-source: '+str(e)
     except (t.Inconclusive,EOFError,ConnectionError,OSError) as e:
         return 255,'UNKNOWN terminal disconnected or unavailable: '+type(e).__name__
     except ImportError:return 127,'Paramiko unavailable; no alternate transport used'

@@ -29,7 +29,7 @@ typedef struct {
     int (*finish)(void*,void*,int commit);
     int (*mkdir)(void*,const char*);
 } wb_sftp_write_ops;
-typedef struct { int fd,dir,used,poison; uint32_t serial; void *writer; uint64_t offset; } wb_sftp_handle;
+typedef struct { int fd,dir,used,poison; uint32_t serial; void *writer; uint64_t offset,total; } wb_sftp_handle;
 typedef struct {
     const wb_sftp_ops *ops;
     const wb_sftp_write_ops *create;

@@ -5,9 +5,10 @@ here=Path(__file__).resolve().parent
 src=here.parents[1]/'source'
 core=(src/'vita_ssh_status.c').read_text(encoding='utf8')
 b=core.index('static char pw_diag_source[');end=core.index('/* ---- network ---- */',b)
-assert 'const bool hands_free=return_ok || update_return || quick_ok;' in core
+assert 'const bool hands_free = true;' in core  # 02.18: paired listener never waits for a button
 assert 'SQUARE OPENS PAIRED SSH' not in core and 'PAIRED OPEN NOT CONFIRMED' not in core
-assert 'initial_power_drain(registration,hands_free,quick_ok,return_ok,update_return || quick_ok)' in core
+assert 'await_choice("CHECK MAC PUBLIC PIN"' not in core  # host key / owner pin never shown on the Vita
+assert 'initial_power_drain(registration,hands_free,true,false,true)' in core
 with tempfile.TemporaryDirectory() as tmp:
     p=Path(tmp)
     (p/'drain.inc').write_bytes(core[b:end].encode())

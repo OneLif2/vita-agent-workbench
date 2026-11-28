@@ -20,6 +20,7 @@
 #include <psp2/kernel/threadmgr.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -282,6 +283,10 @@ static int accept_one(wb_ssh *s, wb_core *core) {
     s->accept_used++;
     s->session = ssh_new();
     if (!s->session || !nonblock(fd)) { if (fd >= 0) close(fd); return 0; }
+#ifdef TCP_NODELAY
+    { int one = 1; (void)setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one); }
+#endif
+    { int sz = 524288; (void)setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &sz, sizeof sz); (void)setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sz, sizeof sz); }
     if (ssh_bind_accept_fd(s->bind, s->session, fd) != SSH_OK) {
         if (ssh_get_fd(s->session) != fd) close(fd);
         return 0;
@@ -411,6 +416,10 @@ static bool sftp_admitted(wb_ssh *s,wb_core *core) {
 static int sftp_rd(void *p,uint8_t *buf,size_t cap) {
     wb_ssh *s=p;
     int n=ssh_channel_read_nonblocking(s->channel,buf,(uint32_t)cap,0);
+    if(n==0 && !ssh_channel_is_eof(s->channel)){
+        (void)ssh_channel_poll_timeout(s->channel,0,0);
+        n=ssh_channel_read_nonblocking(s->channel,buf,(uint32_t)cap,0);
+    }
     if(n>0){refresh_idle(s);return n;}
     if(n<0 && n!=SSH_AGAIN && n!=SSH_EOF)return -1;
     return n==SSH_EOF || ssh_channel_is_eof(s->channel)?-2:0;
@@ -536,19 +545,35 @@ static bool request(wb_ssh *s, wb_core *core, ssh_message m) {
     }
     if (type == SSH_REQUEST_CHANNEL && s->channel) return handle_channel(s, core, m);
 
-    if (type == SSH_REQUEST_GLOBAL && sub == SSH_GLOBAL_REQUEST_TCPIP_FORWARD) {
-        if (core && core->note) core->note(core->ctx, "DENY FORWARD");
+    if (type == SSH_REQUEST_GLOBAL) {
+        if (sub == SSH_GLOBAL_REQUEST_TCPIP_FORWARD) {
+            if (core && core->note) core->note(core->ctx, "DENY FORWARD");
+            return ssh_message_reply_default(m) == SSH_OK;
+        }
+        /* OpenSSH ServerAliveInterval sends global keepalive@openssh.com requests.
+         * Reply default (SSH_MSG_REQUEST_FAILURE) without closing the active channel. */
+        if (s->authenticated && s->channel) refresh_idle(s);
         return ssh_message_reply_default(m) == SSH_OK;
     }
     if (type == SSH_REQUEST_CHANNEL_OPEN && sub == SSH_CHANNEL_DIRECT_TCPIP) {
         if (core && core->note) core->note(core->ctx, "DENY FORWARD");
         return ssh_message_reply_default(m) == SSH_OK;
     }
-    if (type == SSH_REQUEST_CHANNEL || type == SSH_REQUEST_GLOBAL || type == SSH_REQUEST_CHANNEL_OPEN) {
+    if (type == SSH_REQUEST_CHANNEL || type == SSH_REQUEST_CHANNEL_OPEN) {
         (void)ssh_message_reply_default(m);
         return finish_channel(s, 126);
     }
     return ssh_message_reply_default(m) == SSH_OK;
+}
+
+/* Already admitted owner PTY only. No timeout relaxation for unauthenticated,
+ * exec, subsystem, password/challenge, closing or dead channels. EOF/network
+ * errors and local revocation still follow the ordinary shutdown path. */
+static bool interactive_idle_keep(const wb_ssh *s) {
+    return s && s->authenticated && s->mode.mode==MODE_B_KEY && s->mode.accepted &&
+           auth_nonzero(s->mode.pin,sizeof s->mode.pin) && s->shell_pty && s->shell &&
+           !s->shell->closing && s->channel && wb_ssh_connected(s) &&
+           !ssh_channel_is_closed(s->channel) && !ssh_channel_is_eof(s->channel);
 }
 
 int wb_ssh_service(wb_ssh *s, wb_core *core) {
@@ -558,7 +583,7 @@ int wb_ssh_service(wb_ssh *s, wb_core *core) {
     const uint64_t t = now_ms();
     if (!s->kex && t >= s->kex_deadline) { fail(s, "kex timeout"); wb_ssh_end_session(s); return 1; }
     if (!s->authenticated && t >= s->auth_deadline) { fail(s, "auth timeout"); wb_ssh_end_session(s); return 1; }
-    if (s->authenticated && t >= s->idle_deadline) { fail(s, "idle timeout"); wb_ssh_end_session(s); return 1; }
+    if (s->authenticated && t >= s->idle_deadline && !interactive_idle_keep(s)) { fail(s, "idle timeout"); wb_ssh_end_session(s); return 1; }
 
     if (!s->kex) {
         s->kex_steps++;
@@ -592,4 +617,15 @@ int wb_ssh_service(wb_ssh *s, wb_core *core) {
     if (!ok) { fail(s, "protocol error"); wb_ssh_end_session(s); return 1; }
     if (s->close_after) { s->close_after = false; wb_ssh_end_session(s); }
     return 1;
+}
+
+void wb_ssh_keepalive(wb_ssh *s) {
+    if (!s || !s->session || !s->authenticated || !ssh_is_connected(s->session)) return;
+    for (unsigned i = 0; i < 4; i++) {
+        ssh_message m = ssh_message_get(s->session);
+        if (!m) break;
+        if (ssh_message_type(m) == SSH_REQUEST_GLOBAL) refresh_idle(s);
+        (void)ssh_message_reply_default(m);
+        ssh_message_free(m);
+    }
 }

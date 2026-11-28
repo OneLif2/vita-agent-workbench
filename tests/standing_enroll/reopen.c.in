@@ -1,0 +1,48 @@
+#include <assert.h>
+#include <stdbool.h>
+#include <stdio.h>
+#include <string.h>
+#define WB_OK 0
+#define WB_REOPEN_MARKER "verified-private-reopen-marker"
+#define WB_VERSION version
+static const char *version;
+static bool marker,consent,remove_ok,exec_ok;
+static unsigned enrolls,removes,execs,assertions,cases;
+static int ret;
+#define CHECK(x) do {assert(x);assertions++;} while(0)
+static bool wb_reopen_requested(void){return marker;}
+static int r1_remove(const char *path){
+    assert(!strcmp(path,WB_REOPEN_MARKER));removes++;
+    if(remove_ok){marker=false;return WB_OK;}return -1;
+}
+static bool wb_reopen_self(void){assert(!marker&&removes);execs++;return exec_ok;}
+static bool log_event(const char *s){assert(s&&*s);return true;}
+static bool wb_standing_reenroll_local(const int *ticket){assert(ticket==&ret);enrolls++;return consent;}
+static int early(void){
+ACTUAL_EARLY_REOPEN
+    return 1;
+}
+static int after_verified_return(void){
+ACTUAL_ENROLL_CALL
+ACTUAL_POST_ENROLL_REOPEN
+    return 1;
+}
+static void reset(const char *v){
+    version=v;marker=remove_ok=exec_ok=true;consent=false;enrolls=removes=execs=0;
+}
+int main(void){
+    reset("02.08");CHECK(early()==1);CHECK(marker&&!removes&&!execs&&!enrolls);
+    CHECK(after_verified_return()==1);CHECK(enrolls==1&&marker&&!removes&&!execs);cases++;
+    reset("02.08");consent=true;CHECK(early()==1);
+    CHECK(after_verified_return()==0);CHECK(enrolls==1&&removes==1&&execs==1&&!marker);cases++;
+    reset("02.08");marker=false;consent=true;CHECK(early()==1);
+    CHECK(after_verified_return()==1);CHECK(enrolls==1&&!removes&&!execs);cases++;
+    reset("02.07");CHECK(early()==0);CHECK(!enrolls&&removes==1&&execs==1&&!marker);cases++;
+    reset("02.09");CHECK(early()==0);CHECK(!enrolls&&removes==1&&execs==1&&!marker);cases++;
+    reset("02.08");consent=true;remove_ok=false;CHECK(early()==1);
+    CHECK(after_verified_return()==1);CHECK(enrolls==1&&removes==1&&!execs&&marker);cases++;
+    reset("02.08");consent=true;exec_ok=false;CHECK(early()==1);
+    CHECK(after_verified_return()==1);CHECK(enrolls==1&&removes==1&&execs==1&&!marker);cases++;
+    printf("PASS %u actual main reopen-order cases, %u assertions: 02.08 marker cannot bypass local enrollment; failed consent never reexecutes; other versions retain early reopen\n",cases,assertions);
+    return 0;
+}

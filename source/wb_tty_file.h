@@ -5,9 +5,14 @@
 #include <stddef.h>
 #include "wb_sha256.h"
 
-enum { WB_TTY_CHUNK=2048, WB_TTY_LINE=WB_TTY_CHUNK*2+32, WB_TTY_REPLY=WB_TTY_LINE+128 };
+enum { WB_TTY_CHUNK=2048, WB_TTY_BATCH_FRAMES=8, WB_TTY_BATCH_BYTES=WB_TTY_CHUNK*WB_TTY_BATCH_FRAMES,
+       WB_TTY_LINE=WB_TTY_CHUNK*2+32, WB_TTY_REPLY=WB_TTY_LINE+128 };
 typedef struct {
     void *handle;
+    /* Bounded heap allocation for put-batch only. offset remains the written
+     * (not yet durable) watermark; buffered bytes MUST NOT appear in ACK/UI. */
+    uint8_t *batch;
+    size_t buffered;
     uint64_t size,offset;
     bool put;
     size_t n;
@@ -27,7 +32,8 @@ const char *wb_tty_vread(void *opaque,uint8_t *p,size_t cap,size_t *n);
 const char *wb_tty_vfinish(void *opaque,bool commit,const char *shahex);
 bool wb_tty_recognizes(const char *line);
 const char *wb_tty_begin(wb_tty_file *f,const char *line);
-/* 1 continue, 0 done/cancel, -1 error (close channel after flushing receipt). */
+/* 1 continue (reply may be empty while collecting a batch), 0 done/cancel,
+ * -1 error (close channel after flushing receipt). */
 int wb_tty_frame(wb_tty_file *f,bool *private_reply);
 void wb_tty_abort(wb_tty_file *f);
 #endif

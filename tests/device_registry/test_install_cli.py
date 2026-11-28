@@ -23,7 +23,9 @@ class InstallOnly(unittest.TestCase):
                 op,path,n,digest=command.split()
                 self.assertEqual((op,n,digest),("put","311546","sha256="+SHA))
                 self.assertRegex(path,r"^ux0:/VITA-POC/VSSH00001-e6363e62-[a-f0-9]{12}\.vpk$")
-                self.assertEqual(kwargs["stdin_bytes"],VPK.read_bytes())
+                source=kwargs["stdin_bytes"]
+                self.assertIsInstance(source,wbctl.wb_tree.FileSource)
+                self.assertEqual(source.path.read_bytes(),VPK.read_bytes())
                 return reply.get("put_rc",0),f"OK put path={path} bytes={n} sha256="+reply.get("digest",SHA)
             self.assertEqual(len(commands),2)
             self.assertEqual(command, "app-install "+commands[0].split()[1])

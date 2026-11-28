@@ -9,5 +9,9 @@
 int wb_vita_shell_isdir(void *ctx,const char *canonical,wb_out *out);
 int wb_vita_shell_list(void *ctx,const char *canonical,bool longfmt,wb_out *out);
 int wb_vita_shell_cat(void *ctx,const char *canonical,wb_out *out);
+/* Only the explicit game Logs namespace; exact component/type checks before
+ * opening SCE_O_RDONLY. Returns 0 with an owned fd, -1 with fd=-1 otherwise.
+ * Never exposes another app directory, a symlink, or a writable descriptor. */
+int wb_vita_shell_open_game_log(const char *canonical,int *fd);
 
 #endif

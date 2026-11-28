@@ -21,6 +21,7 @@
  *     or oversized file simply contributes no rows. */
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
 /* The verifier is compiled only where a real mbedTLS lives (the Vita build).
@@ -43,7 +44,7 @@
 #include "wb_vita_io.h"
 
 #define WB_APP_LOCAL_PATH "ux0:data/INAP00018/apps.local"
-enum { WB_APP_LOCAL_ROWS = 8, WB_APP_LOCAL_FILE = 1024, WB_APP_LOCAL_MSG = 160 };
+enum { WB_APP_LOCAL_ROWS = 64, WB_APP_LOCAL_FILE = 8192, WB_APP_LOCAL_MSG = 160 };
 
 typedef struct { char title[10]; char ver[6]; char sha[65]; } wb_app_row;
 static wb_app_row wb_app_local_rows[WB_APP_LOCAL_ROWS];
@@ -122,13 +123,49 @@ static int wb_app_local_match(const char *t, const char *v, const char *h) {
             return (h && !strcmp(h, wb_app_local_rows[i].sha)) ? 1 : 0;
     return -1;
 }
+#if defined(__GNUC__)
+__attribute__((unused))
+#endif
+static bool wb_app_local_persist(void) {
+    char *buf = (char *)malloc(WB_APP_LOCAL_FILE);
+    if (!buf) return false;
+    size_t used = 0;
+    bool ok = true;
+    for (unsigned i = 0; i < wb_app_local_count; ++i) {
+        const wb_app_row *r = &wb_app_local_rows[i];
+        const int n = snprintf(buf + used, WB_APP_LOCAL_FILE - used, "%s %s %s -\n", r->title, r->ver, r->sha);
+        if (n <= 0 || (size_t)n >= WB_APP_LOCAL_FILE - used) { ok = false; break; }
+        used += (size_t)n;
+    }
+    if (ok) ok = (wb_vita_write_file(WB_APP_LOCAL_PATH, buf, used, false) == WB_OK);
+    free(buf);
+    if (ok) wb_app_local_load();
+    return ok;
+}
+#if defined(__GNUC__)
+__attribute__((unused))
+#endif
+static bool wb_app_local_prune(const char *title_or_null, unsigned *removed_out) {
+    unsigned kept = 0, removed = 0;
+    for (unsigned i = 0; i < wb_app_local_count; ++i) {
+        if (!title_or_null || !strcmp(wb_app_local_rows[i].title, title_or_null)) {
+            removed++;
+        } else {
+            if (kept != i) wb_app_local_rows[kept] = wb_app_local_rows[i];
+            kept++;
+        }
+    }
+    wb_app_local_count = kept;
+    if (removed_out) *removed_out = removed;
+    if (!removed) return true;
+    return wb_app_local_persist();
+}
 /* Verify the owner's signature over this exact artifact, then persist the row.
  * Order matters: nothing is written before the signature checks out. */
 #if defined(WB_APP_LOCAL_HAVE_MBEDTLS)
-static bool wb_app_local_approve(const char *t, const char *v, unsigned long long bytes,
-                                 const char *h, const char *rs, const char *ss) {
-    char msg[WB_APP_LOCAL_MSG], key_id[65], line[96];
-    if (!wb_app_local_message(msg, t, v, bytes, h)) return false;
+static bool wb_owner_verify_message(const char *msg,const char *rs,const char *ss) {
+    char key_id[65];
+    if (!msg || !*msg) return false;
     if (!wb_standing_scalars(rs, ss) || !wb_standing_hex(WB_STANDING_SEC1, 130)) return false;
     unsigned char sec[65], r[32], s[32], hash[32];
     wb_sha256 sh;
@@ -151,12 +188,25 @@ static bool wb_app_local_approve(const char *t, const char *v, unsigned long lon
                     mbedtls_ecdsa_verify(&group, hash, sizeof hash, &pt, &mr, &ms) == 0;
     mbedtls_mpi_free(&ms); mbedtls_mpi_free(&mr);
     mbedtls_ecp_point_free(&pt); mbedtls_ecp_group_free(&group);
-    if (!ok) return false;
-    const int n = snprintf(line, sizeof line, "%s %s %s -\n", t, v, h);
-    if (n <= 0 || (size_t)n >= sizeof line) return false;
-    if (wb_vita_write_file(WB_APP_LOCAL_PATH, line, (size_t)n, true) != WB_OK) return false;
+    return ok;
+}
+static bool wb_app_local_approve(const char *t, const char *v, unsigned long long bytes,
+                                 const char *h, const char *rs, const char *ss) {
+    char msg[WB_APP_LOCAL_MSG];
+    if(!wb_app_local_message(msg,t,v,bytes,h)||!wb_owner_verify_message(msg,rs,ss))return false;
+    /* Reload first so capacity/dedup checks reflect durable state. */
     wb_app_local_load();
-    return true;
+    for (unsigned i = 0; i < wb_app_local_count; ++i) {
+        if (!strcmp(wb_app_local_rows[i].title, t) && !strcmp(wb_app_local_rows[i].ver, v)) {
+            /* Same title+ver: idempotent if same SHA, else update SHA in place. */
+            if (!strcmp(wb_app_local_rows[i].sha, h)) return true;
+            memcpy(wb_app_local_rows[i].sha, h, 65);
+            return wb_app_local_persist();
+        }
+    }
+    if (!wb_app_local_add(t, v, h)) return false;
+    if (!wb_app_local_persist()) { wb_app_local_load(); return false; }
+    return wb_app_local_match(t, v, h) == 1;
 }
 #endif /* WB_APP_LOCAL_HAVE_MBEDTLS */
 #endif

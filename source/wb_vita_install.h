@@ -29,5 +29,6 @@ const wb_inst_backend *wb_vita_install_backend(wb_vita_install *vi);
 int wb_vita_updater_registered(int *registered,int *detail);
 
 int wb_vita_promote_stage(const char *stage, bool skip_period, int *detail);
+int wb_vita_delete_pkg(const char *title, int *detail);
 
 #endif

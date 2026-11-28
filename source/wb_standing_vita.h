@@ -70,6 +70,111 @@ static void wb_standing_bootstrap(const wb_r1_ticket *ret) {
     (void)ret;
 #endif
 }
+/* One release-scoped recovery of local standing consent. The caller must have
+ * consumed r1_boot's private proof, assigned r1_completed/r1_bound and bound
+ * this listener. A terminal, ordinary boot or updater marker is not authority.
+ * This never arms an R1 update: it only offers a SECOND physical-owner choice. */
+static bool wb_standing_focus_settle(uint32_t *generation);
+static bool wb_standing_enroll_note(const char *reason) {
+    char note[112];
+    (void)snprintf(note,sizeof note,"R1 STANDING LOCAL %s",reason);
+    return log_event(note);
+}
+static bool wb_standing_enroll_bound(const wb_r1_ticket *ret) {
+    return ret && r1_bound && !g_ssh.session && !strcmp(WB_VERSION,"02.08") &&
+        wb_r1_valid(ret,r1_now()) && !memcmp(ret,&r1_completed,sizeof *ret) &&
+        !strcmp(ret->source_ver,"02.06") && !strcmp(ret->target_ver,"02.08") &&
+        strcmp(ret->source_run,a.run_hex) &&
+        wb_r1_pin_equal(ret->host_pin,a.pin) && wb_r1_pin_equal(ret->owner_pin,a.user_pin) &&
+        wb_standing_provisioned(a.pin,a.user_pin) &&
+        wb_r1_hex(wb_standing_key_id(),64,false,true);
+}
+static bool wb_standing_enroll_installed(const wb_r1_ticket *ret) {
+    char installed[WBQ_CAP]={0};
+    return wq_installed_receipt("ux0:app/" WB_TITLE_ID,WB_VERSION,installed)==WB_OK &&
+        !strcmp(installed,ret->receipt);
+}
+static bool wb_standing_reenroll_local(const wb_r1_ticket *ret) {
+    wb_standing_disk current={0};
+    if(wb_standing_active(&current))return true; /* Existing consent is unchanged. */
+    if(!wb_standing_enroll_bound(ret)){
+        (void)wb_standing_enroll_note("REFUSED RETURN");return false;
+    }
+    if(r1_exists(WB_STANDING_PATH)<0 || !wb_standing_enroll_installed(ret)){
+        (void)wb_standing_enroll_note("REFUSED INSTALLED OR STORAGE");return false;
+    }
+    /* Remote-start deliberately did not recapture foreground or drain its
+     * registration callback. Reuse the EXISTING bounded benign-only settle;
+     * never clear real power, suspend, low-battery or overlay vetoes here. */
+    uint32_t generation=0;
+    if(!wb_standing_focus_settle(&generation) || !wb_standing_enroll_bound(ret)){
+        (void)wb_standing_enroll_note("REFUSED SETTLE");return false;
+    }
+    if(!wb_standing_enroll_note("PROMPT"))return false;
+    const uint64_t start=now_ms();uint64_t previous=start,rtc=r1_now();bool neutral=false;
+    for(;;){
+        const uint64_t now=now_ms(),wall=r1_now();
+        if(now<previous || now<start || now-start>=60000 || wall<rtc ||
+           !wb_standing_enroll_bound(ret) || a.power_calls!=generation){
+            (void)wb_standing_enroll_note("REFUSED EXPIRED OR CLOCK");return false;
+        }
+        previous=now;rtc=wall;
+        (void)sceKernelPowerTick(SCE_KERNEL_POWER_TICK_DISABLE_AUTO_SUSPEND);
+        (void)sceKernelPowerTick(SCE_KERNEL_POWER_TICK_DISABLE_OLED_OFF);
+        if(!foreground(false) || a.power_calls!=generation ||
+           scePowerIsSuspendRequired()!=0 || scePowerIsLowBattery()!=0){
+            (void)wb_standing_enroll_note("REFUSED FOCUS OR POWER");return false;
+        }
+        if(!display_frame_prompt("ENABLE AUTOMATIC UPDATES FOR PAIRED PC",NULL,0,
+                                "RELEASE THEN CROSS; START/SELECT CANCEL")){
+            (void)wb_standing_enroll_note("REFUSED DISPLAY");return false;
+        }
+        SceCtrlData pad={0};
+        if(sceCtrlPeekBufferPositive(0,&pad,1)<=0){
+            (void)wb_standing_enroll_note("REFUSED INPUT");return false;
+        }
+        if(pad.buttons&(SCE_CTRL_START|SCE_CTRL_SELECT)){
+            (void)wb_standing_enroll_note("CANCELLED");return false;
+        }
+        if(pad.buttons==SCE_CTRL_CROSS && neutral)break;
+        neutral=pad.buttons==0;
+        sceKernelDelayThread(16000);
+    }
+    /* Hashing may block; recheck the same return, clock, foreground and a local
+     * cancellation sample AFTER the installed-content read and before save. */
+    const bool installed=wb_standing_enroll_installed(ret);
+    const uint64_t end=now_ms(),wall=r1_now();SceCtrlData veto={0};
+    if(!installed || end<previous || end<start || end-start>=60000 || wall<rtc ||
+       !wb_standing_enroll_bound(ret) || !foreground(false) || a.power_calls!=generation ||
+       scePowerIsSuspendRequired()!=0 || scePowerIsLowBattery()!=0 ||
+       sceCtrlPeekBufferPositive(0,&veto,1)<=0 || (veto.buttons&(SCE_CTRL_START|SCE_CTRL_SELECT))){
+        (void)wb_standing_enroll_note("REFUSED FINAL CHECK");return false;
+    }
+    if(!wb_standing_enroll_note("PHYSICAL CROSS ACCEPTED"))return false;
+    wb_standing_disk record={.magic="WBS1-01",.permit=WB_STANDING_ACTIVE};
+    memcpy(record.key,wb_standing_key_id(),65);
+    memcpy(record.host,ret->host_pin,65);memcpy(record.owner,ret->owner_pin,65);
+    memcpy(record.source_run,ret->source_run,17);memcpy(record.nonce,ret->nonce,33);
+    bool saved=wb_standing_saved(&record);
+    if(saved){
+        standing_disabled_this_run=false;
+        const uint64_t finished=now_ms(),wall_done=r1_now();
+        saved=wb_standing_active(&current) && wb_standing_enroll_bound(ret) &&
+            finished>=end && finished>=start && finished-start<60000 && wall_done>=wall &&
+            foreground(false) && a.power_calls==generation &&
+            scePowerIsSuspendRequired()==0 && scePowerIsLowBattery()==0;
+    }
+    if(!saved || !wb_standing_enroll_note("ENABLED VERIFIED")){
+        /* A lost save/readback/diagnostic never enables this run. Best effort
+         * tombstone also undoes a possible completed write with a lost ACK. */
+        standing_disabled_this_run=true;
+        wb_standing_disk tomb={.magic="WBS1-01",.permit=WB_STANDING_REVOKED};
+        const bool revoked=wb_standing_saved(&tomb);
+        (void)wb_standing_enroll_note(revoked?"FAILED; REVOKED VERIFIED":"FAILED; STORAGE UNCONFIRMED");
+        return false;
+    }
+    return true;
+}
 /* Local SELECT only. Fail closed in RAM even if persistence itself fails;
  * never show revoked as durable until the exact private bytes read back. */
 static bool wb_standing_veto(void) {

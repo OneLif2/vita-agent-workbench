@@ -1,4 +1,5 @@
 #include "wb_err.h"
+#include "wb_zip.h"
 
 const char *wb_err_name(int code) {
     switch (code) {
@@ -20,6 +21,7 @@ const char *wb_err_name(int code) {
         case WB_E_NOMEM:       return "out-of-memory";
         case WB_E_TIMEOUT:     return "timeout";
         case WB_E_PARTIAL:     return "short-io";
+        case WB_E_ZIP64:       return "zip64-unsupported";
         default:               return "unknown-error";
     }
 }

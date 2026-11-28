@@ -1,3 +1,6 @@
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC optimize ("O3")
+#endif
 #include "wb_zip.h"
 #include "wb_crc32.h"
 #include "wb_err.h"
@@ -12,7 +15,11 @@ enum {
     SIG_EOCD    = 0x06054b50u
 };
 
-#define WB_ZIP_MAX_COMPRESSED (WB_ZIP_MAX_FILE + 1024u * 1024u)
+#ifdef __vita__
+#define ZIP_IO_SIZE 131072u
+#else
+#define ZIP_IO_SIZE 16384u
+#endif
 
 static uint16_t le16(const uint8_t *p) { return (uint16_t)(p[0] | (p[1] << 8)); }
 static uint32_t le32(const uint8_t *p) {
@@ -59,6 +66,14 @@ static int find_eocd(const wb_reader *rd, uint64_t *cd_off, uint64_t *cd_size, u
         if (i + 22u + comment != scan) continue;
         if (le16(tail + i + 4) || le16(tail + i + 6) ||
             le16(tail + i + 8) != entries) continue;
+        if (i >= 20u && le32(tail + i - 20u) == 0x07064b50u) {
+            found = WB_E_ZIP64; break; /* ZIP64 EOCD locator */
+        }
+        /* ZIP64 uses these marker values even when a ZIP64 extra is absent.
+         * Do not silently reinterpret them as a supported ZIP32 archive. */
+        if (entries == 0xffffu || csize == UINT32_MAX || coff == UINT32_MAX) {
+            found = WB_E_ZIP64; break;
+        }
         if (coff + csize != rd->size - scan + i) continue;
         *cd_off = coff; *cd_size = csize; *count = entries;
         found = WB_OK;
@@ -74,7 +89,7 @@ int wb_zip_open(wb_zip *z, const wb_reader *rd) {
     z->rd = *rd;
     int rc = find_eocd(rd, &z->cd_off, &z->cd_size, &z->count);
     if (rc != WB_OK) return rc;
-    if (z->count > WB_ZIP_MAX_ENTRIES) return WB_E_LIMIT;
+    z->next_off = z->cd_off;
     return WB_OK;
 }
 
@@ -103,8 +118,29 @@ static int read_central_entry(wb_zip *z, uint64_t *position, wb_zip_entry *e) {
     e->csize  = le32(hdr + 20);
     e->usize  = le32(hdr + 24);
     e->lho    = le32(hdr + 42);
-    if (e->usize == 0xffffffffu || e->csize == 0xffffffffu) return WB_E_UNSUPPORTED; /* zip64 */
-    if (e->flags & 0x0001u) return WB_E_UNSUPPORTED; /* encrypted */
+    if (e->usize == UINT32_MAX || e->csize == UINT32_MAX || e->lho == UINT32_MAX)
+        return WB_E_ZIP64; /* ZIP64 is not implemented. */
+    /* ZIP64 extra fields are rejected even when small compatibility fields fit. */
+    uint64_t extra_pos = pos + sizeof hdr + namelen;
+    const uint64_t extra_end = extra_pos + extralen;
+    while (extra_pos < extra_end) {
+        uint8_t extra[4];
+        if (extra_end - extra_pos < sizeof extra) return WB_E_FORMAT;
+        rc = z->rd.read_at(z->rd.ctx, extra_pos, extra, sizeof extra);
+        if (rc != WB_OK) return rc;
+        const unsigned id = le16(extra), size = le16(extra + 2);
+        extra_pos += sizeof extra;
+        if (size > extra_end - extra_pos) return WB_E_FORMAT;
+        if (id == 0x0001u) return WB_E_ZIP64;
+        extra_pos += size;
+    }
+    if (e->flags & (0x0001u | 0x0040u | 0x2000u)) return WB_E_UNSUPPORTED; /* encrypted */
+    /* Never materialise Unix links, devices or sockets as package files. */
+    const unsigned mode = le32(hdr + 38) >> 16;
+    const unsigned kind = mode & 0170000u;
+    if (kind && kind != 0100000u && kind != 0040000u) return WB_E_UNSUPPORTED;
+    if ((kind == 0040000u) != (e->name[namelen - 1] == '/') && kind)
+        return WB_E_FORMAT;
     if (e->method != 0 && e->method != 8) return WB_E_UNSUPPORTED;
     *position = record_end;
     return WB_OK;
@@ -114,11 +150,14 @@ int wb_zip_next(wb_zip *z, unsigned *cursor, wb_zip_entry *e) {
     if (!z || !cursor || !e) return WB_E_ARG;
     if (*cursor >= z->count) return 1;
     uint64_t position = z->cd_off;
-    for (unsigned i = 0; i <= *cursor; i++) {
+    unsigned start = 0;
+    if (*cursor == z->next_index) { position = z->next_off; start = *cursor; }
+    for (unsigned i = start; i <= *cursor; i++) {
         const int rc = read_central_entry(z, &position, e);
         if (rc != WB_OK) return rc;
     }
     ++*cursor;
+    z->next_index = *cursor; z->next_off = position;
     return WB_OK;
 }
 
@@ -140,6 +179,7 @@ static int local_data_offset(wb_zip *z, const wb_zip_entry *e, uint64_t *off) {
     if (rc != WB_OK) return rc;
     if (le32(hdr) != SIG_LOCAL || le16(hdr + 6) != e->flags ||
         le16(hdr + 8) != e->method) return WB_E_FORMAT;
+    if (le32(hdr + 18) == UINT32_MAX || le32(hdr + 22) == UINT32_MAX) return WB_E_ZIP64;
     if (!(e->flags & 0x0008u) &&
         (le32(hdr + 14) != e->crc || le32(hdr + 18) != e->csize ||
          le32(hdr + 22) != e->usize)) return WB_E_FORMAT;
@@ -149,80 +189,129 @@ static int local_data_offset(wb_zip *z, const wb_zip_entry *e, uint64_t *off) {
         return WB_E_FORMAT;
     *off = e->lho + sizeof hdr + namelen + extralen;
     if (*off > z->cd_off || e->csize > z->cd_off - *off) return WB_E_FORMAT;
+    if (e->flags & 0x0008u) {
+        /* Descriptor CRC / sizes must agree with central metadata. */
+        if ((le32(hdr + 14) && le32(hdr + 14) != e->crc) ||
+            (le32(hdr + 18) && le32(hdr + 18) != e->csize) ||
+            (le32(hdr + 22) && le32(hdr + 22) != e->usize)) return WB_E_FORMAT;
+        uint8_t desc[16];
+        const uint64_t pos = *off + e->csize;
+        if (pos > z->cd_off || z->cd_off - pos < 12u) return WB_E_FORMAT;
+        rc = z->rd.read_at(z->rd.ctx, pos, desc, 12);
+        if (rc != WB_OK) return rc;
+        /* A signature-free CRC is allowed to equal the optional signature. */
+        if (le32(desc) != e->crc || le32(desc + 4u) != e->csize ||
+            le32(desc + 8u) != e->usize) {
+            if (le32(desc) != 0x08074b50u || z->cd_off - pos < 16u) return WB_E_FORMAT;
+            rc = z->rd.read_at(z->rd.ctx, pos + 12u, desc + 12u, 4);
+            if (rc != WB_OK) return rc;
+            if (le32(desc + 4u) != e->crc || le32(desc + 8u) != e->csize ||
+                le32(desc + 12u) != e->usize) return WB_E_FORMAT;
+        }
+    }
     char local_name[WB_ZIP_NAME_MAX];
     rc = z->rd.read_at(z->rd.ctx, e->lho + sizeof hdr, local_name, namelen);
     if (rc != WB_OK) return rc;
     return memcmp(local_name, e->name, namelen) == 0 ? WB_OK : WB_E_FORMAT;
 }
 
-int wb_zip_read(wb_zip *z, const wb_zip_entry *e, uint8_t *out, size_t cap, size_t *n) {
-    if (!z || !e || !out) return WB_E_ARG;
-    if (e->usize > cap) return WB_E_LIMIT;
-    uint64_t off = 0;
-    int rc = local_data_offset(z, e, &off);
+typedef struct {
+    wb_zip *zip;
+    uint64_t offset, size, produced;
+    uint32_t crc;
+    wb_zip_sink sink;
+    void *sink_ctx;
+} stream_ctx;
+
+static int stream_read(const void *ctx, uint64_t off, void *buf, size_t n) {
+    const stream_ctx *c = (const stream_ctx *)ctx;
+    if (off > c->size || n > c->size - off) return WB_E_PARTIAL;
+    return c->zip->rd.read_at(c->zip->rd.ctx, c->offset + off, buf, n);
+}
+static int stream_write(void *ctx, const void *buf, size_t n) {
+    stream_ctx *c = (stream_ctx *)ctx;
+    const int rc = c->sink(c->sink_ctx, buf, n);
     if (rc != WB_OK) return rc;
-    if (e->csize > WB_ZIP_MAX_COMPRESSED) return WB_E_LIMIT;
-    uint8_t *raw = (uint8_t *)malloc((size_t)e->csize + 1u);
-    if (!raw) return WB_E_NOMEM;
-    rc = z->rd.read_at(z->rd.ctx, off, raw, (size_t)e->csize);
-    if (rc != WB_OK) { free(raw); return rc; }
-    size_t produced = 0;
-    if (e->method == 0) {
-        if (e->csize != e->usize) rc = WB_E_FORMAT;
-        else { memcpy(out, raw, (size_t)e->csize); produced = (size_t)e->csize; }
-    } else {
-        rc = wb_inflate_raw(out, cap, &produced, raw, (size_t)e->csize);
-    }
-    free(raw);
-    if (rc != WB_OK) return rc;
-    if (produced != e->usize) return WB_E_FORMAT;
-    if (wb_crc32(out, produced) != e->crc) return WB_E_FORMAT;
-    if (n) *n = produced;
+    c->crc = wb_crc32_update(c->crc, buf, n);
+    c->produced += n;
     return WB_OK;
 }
 
-static int write_entry(wb_zip *z, const wb_zip_entry *e, const wb_writer *w, uint64_t *written) {
-    uint64_t off = 0;
-    int rc = local_data_offset(z, e, &off);
+int wb_zip_stream_entry(wb_zip *z, const wb_zip_entry *e, wb_zip_sink sink,
+                         void *ctx, uint64_t *n) {
+    if (n) *n = 0;
+    if (!z || !e || !sink) return WB_E_ARG;
+    if (!wb_zip_name_ok(e->name)) return WB_E_PATH;
+    if (e->method != 0 && e->method != 8) return WB_E_UNSUPPORTED;
+    if (e->flags & (0x0001u | 0x0040u | 0x2000u)) return WB_E_UNSUPPORTED;
+    stream_ctx c = {.zip=z, .size=e->csize, .sink=sink, .sink_ctx=ctx};
+    int rc = local_data_offset(z, e, &c.offset);
     if (rc != WB_OK) return rc;
-    if (e->usize > WB_ZIP_MAX_FILE || e->csize > WB_ZIP_MAX_COMPRESSED)
-        return WB_E_LIMIT;
-    if (e->csize == 0 && e->usize == 0) {
-        if (e->method != 0 || e->crc != 0) return WB_E_FORMAT;
-        rc = w->create(w->ctx, e->name, 0);
-        if (rc != WB_OK) return rc;
-        return w->close(w->ctx);
-    }
-    uint8_t *raw = (uint8_t *)malloc((size_t)e->csize + 1u);
-    if (!raw) return WB_E_NOMEM;
-    rc = z->rd.read_at(z->rd.ctx, off, raw, (size_t)e->csize);
-    if (rc != WB_OK) { free(raw); return rc; }
-    uint8_t *data = NULL;
-    size_t len = (size_t)e->usize;
     if (e->method == 0) {
-        data = raw;
-        if (e->csize != e->usize) rc = WB_E_FORMAT;
+        if (e->csize != e->usize) return WB_E_FORMAT;
+#ifdef __vita__
+        uint8_t fallback[16384];
+        uint8_t *heap = (uint8_t *)malloc(ZIP_IO_SIZE);
+        uint8_t *buf = heap ? heap : fallback;
+        const size_t cap = heap ? ZIP_IO_SIZE : sizeof fallback;
+#else
+        uint8_t buf[ZIP_IO_SIZE];
+        const size_t cap = sizeof buf;
+#endif
+        uint64_t pos = 0;
+        while (pos < e->csize) {
+            const uint64_t left = e->csize - pos;
+            const size_t len = left > cap ? cap : (size_t)left;
+            rc = stream_read(&c, pos, buf, len);
+            if (rc != WB_OK) break;
+            rc = stream_write(&c, buf, len);
+            if (rc != WB_OK) break;
+            pos += len;
+        }
+#ifdef __vita__
+        free(heap);
+#endif
     } else {
-        data = (uint8_t *)malloc(len ? len : 1u);
-        if (!data) rc = WB_E_NOMEM;
-        else {
-            size_t produced = 0;
-            rc = wb_inflate_raw(data, len, &produced, raw, (size_t)e->csize);
-            if (rc == WB_OK && produced != len) rc = WB_E_FORMAT;
-        }
+        uint64_t produced = 0;
+        rc = wb_inflate_stream(stream_read, &c, e->csize, stream_write, &c,
+                               e->usize, &produced);
     }
-    if (rc == WB_OK && wb_crc32(data, len) != e->crc) rc = WB_E_FORMAT;
-    if (rc == WB_OK) {
-        rc = w->create(w->ctx, e->name, (uint64_t)len);
-        if (rc == WB_OK) {
-            if (len) rc = w->write(w->ctx, data, len);
-            const int close_rc = w->close(w->ctx);
-            if (rc == WB_OK) rc = close_rc;
-        }
-    }
-    if (data != raw) free(data);
-    free(raw);
-    if (rc == WB_OK && written) *written += (uint64_t)len;
+    if (n) *n = c.produced;
+    if (rc != WB_OK) return rc;
+    if (c.produced != e->usize || c.crc != e->crc) return WB_E_FORMAT;
+    return WB_OK;
+}
+
+typedef struct { uint8_t *out; size_t pos, cap; } buffer_sink;
+static int buffer_write(void *ctx, const void *buf, size_t n) {
+    buffer_sink *b = (buffer_sink *)ctx;
+    if (n > b->cap - b->pos) return WB_E_LIMIT;
+    memcpy(b->out + b->pos, buf, n); b->pos += n;
+    return WB_OK;
+}
+int wb_zip_read(wb_zip *z, const wb_zip_entry *e, uint8_t *out, size_t cap, size_t *n) {
+    if (n) *n = 0;
+    if (!z || !e || (!out && e->usize)) return WB_E_ARG;
+    if (e->usize > cap) return WB_E_LIMIT;
+    buffer_sink b = {out, 0, cap};
+    uint64_t produced = 0;
+    const int rc = wb_zip_stream_entry(z, e, buffer_write, &b, &produced);
+    if (n) *n = b.pos;
+    return rc;
+}
+
+static int writer_sink(void *ctx, const void *buf, size_t n) {
+    const wb_writer *w = (const wb_writer *)ctx;
+    return w->write(w->ctx, buf, n);
+}
+static int write_entry(wb_zip *z, const wb_zip_entry *e, const wb_writer *w, uint64_t *written) {
+    int rc = w->create(w->ctx, e->name, e->usize);
+    if (rc != WB_OK) return rc;
+    uint64_t produced = 0;
+    rc = wb_zip_stream_entry(z, e, writer_sink, (void *)w, &produced);
+    const int close_rc = w->close(w->ctx); /* also close on CRC/read/write failure */
+    if (rc == WB_OK) rc = close_rc;
+    if (rc == WB_OK && written) *written += produced;
     return rc;
 }
 
@@ -254,8 +343,7 @@ static int validate_entries(wb_zip *z) {
             names[i][j] = c >= 'A' && c <= 'Z' ? (char)(c - 'A' + 'a') : c;
         }
 
-        if (e.usize > WB_ZIP_MAX_FILE || e.csize > WB_ZIP_MAX_COMPRESSED ||
-            e.usize > WB_ZIP_MAX_TOTAL - total) { rc = WB_E_LIMIT; break; }
+        if (e.usize > UINT64_MAX - total) { rc = WB_E_LIMIT; break; }
         total += e.usize;
         uint64_t offset;
         rc = local_data_offset(z, &e, &offset);
@@ -287,7 +375,7 @@ int wb_zip_extract_all(wb_zip *z, const wb_writer *w, wb_zip_stats *st,
         const int nrc = read_central_entry(z, &position, &e);
         if (nrc != WB_OK) { if (st) *st = local; return nrc; }
         if (!wb_zip_name_ok(e.name)) { if (st) *st = local; return WB_E_PATH; }
-        if (e.usize > WB_ZIP_MAX_TOTAL - local.bytes) { if (st) *st = local; return WB_E_LIMIT; }
+        if (e.usize > UINT64_MAX - local.bytes) { if (st) *st = local; return WB_E_LIMIT; }
         const bool dir = e.name[strlen(e.name) - 1] == '/';
         int rc;
         if (dir) {

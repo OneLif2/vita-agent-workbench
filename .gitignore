@@ -4,6 +4,7 @@
 **/build/
 **/evidence/
 **/transaction*/
+**/HOST-TESTS.json
 *.vpk
 *.suprx
 *.elf
@@ -27,4 +28,3 @@ source/wb_standing_provision.h
 **/STANDING-PUBLIC-PROFILE.json
 **/authorization.json
 **/apps.local
-**/HOST-TESTS.json

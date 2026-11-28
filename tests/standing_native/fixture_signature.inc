@@ -43,7 +43,14 @@ static FocusResult classify(const FocusEvidence *e,bool capture){
     return focus_result(e->cb,e->power_latched?1u:e->power,e->app_rc,e->state.isSystemUiOverlaid,
         e->rtc_rc,e->tick.tick,capture,!e->state.appEventNum&&!e->state.systemEventNum,a.rtc_last);
 }
-enum{SCE_CTRL_SELECT=1,SCE_CTRL_START=2};
+enum{SCE_CTRL_SELECT=1,SCE_CTRL_START=2,SCE_CTRL_CROSS=4};
+enum{SCE_KERNEL_POWER_TICK_DISABLE_AUTO_SUSPEND=1,SCE_KERNEL_POWER_TICK_DISABLE_OLED_OFF=4};
+/* The release-scoped enrollment has independent physical-gesture tests. These
+ * old standing/signature tests never invoke it; retain SDK-link completeness. */
+static int sceKernelPowerTick(int flags){assert(flags==1||flags==4);return 0;}
+static int display_frame_prompt(const char *label,const char *pin,int dialog,const char *hint){
+    assert(label&&!pin&&!dialog&&hint);return 1;
+}
 typedef struct{unsigned buttons;} SceCtrlData;
 static unsigned pads;
 static bool bad_input;

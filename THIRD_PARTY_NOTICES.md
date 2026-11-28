@@ -1,6 +1,6 @@
 # Third-party notices and licensing scope
 
-The root Apache-2.0 license applies to original Workbench code only. It does not
+The root Apache-2.0 license applies to original project code only. It does not
 relicense third-party material or remove existing notices. This source tree is
 not represented as Apache-only. Binary redistribution requires a separate review
 of all combined components; this publication contains no compiled binaries.
@@ -16,6 +16,6 @@ of all combined components; this publication contains no compiled binaries.
 
 VitaShell package-installer reference retains the copyright of TheFloW; see
 https://github.com/TheOfficialFloW/VitaShell/blob/master/package_installer.c .
-No claim is made that functional API knowledge or original Workbench code changes
+No claim is made that functional API knowledge or original project code changes
 have all been authored by an upstream project. This is a provenance notice, not
 a certification that a future combined binary satisfies every dependency's terms.

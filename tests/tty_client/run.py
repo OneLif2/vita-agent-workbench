@@ -147,10 +147,8 @@ def main():
         refuses(lambda:tree.plan([fld],tree.ROOT,False,w.quoted_path),tree.TreeError)
         refuses(lambda:tree.plan([text,text],tree.ROOT,False,w.quoted_path),tree.TreeError)
         refuses(lambda:tree.plan([text],'ux0:/data',False,w.quoted_path),tree.TreeError)
-        refuses(lambda:tree.plan([text],tree.ROOT+'/a'*12,False,w.quoted_path),tree.TreeError)
+        refuses(lambda:tree.plan([text],tree.ROOT+'/a'*60,False,w.quoted_path))
         refuses(lambda:tree.plan([fld/'..'/'extra.txt'],tree.ROOT,False,w.quoted_path),tree.TreeError)
-        with mock.patch.object(tree,'MAX_ENTRIES',2):
-            refuses(lambda:tree.plan([fld],tree.ROOT,True,w.quoted_path),tree.TreeError)
         with mock.patch.object(tree,'MAX_BYTES',3):
             refuses(lambda:tree.plan([text],tree.ROOT,False,w.quoted_path),tree.TreeError)
         with Channel(exe) as ch:
@@ -163,7 +161,7 @@ def main():
             def lstat(self):return types.SimpleNamespace(st_mode=0o100000,st_file_attributes=0x400)
         refuses(lambda:tree.unlinked(Reparse()),tree.TreeError)
     print('PASS multi-source,no-merge PTY tree send: preserve nested binary, empty file/dir, spaces; pull exact bytes; same PTY check')
-    print('PASS upfront remote collision/local mutation, traversal, reparse, depth/limits policy; interrupted batch preserves item receipts')
+    print('PASS upfront remote collision/local mutation, traversal, reparse, canonical path/per-file limits; interrupted batch preserves item receipts')
     print('PASS PTY client: matching pin -> owner auth -> one PTY -> shell; changed key stops before owner key; command/path refusals; no <01.65 transfer fallback')
     print('PASS fragmented 5-frame binary upload/download through product C shell and TTY1 w/ memory storage, exact bytes+SHA, one-channel ver/status/ver')
     print('PASS existing remote and local file refusal, destination-race, corrupted get receipt + temp cleanup; one photo dispatch, fixture only')

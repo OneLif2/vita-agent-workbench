@@ -35,13 +35,15 @@ static void check_wait(const char *pin,const char *notice,bool online){
     want(18,12,"v" WB_BUILD_TAG " - SSH LISTENING",COLOR(120,255,163));
     if(notice&&*notice&&strcmp(notice,LIVE_TERMINAL_CONTROLS))
         want(490,12,notice,LIVE_TERMINAL_FG);
-    want(18,37,"VITA AGENT TERMINAL / SHARED SSH",LIVE_TERMINAL_FG);
-    want(755,37,online?"AGENT ONLINE":"AGENT IDLE",LIVE_TERMINAL_FG);
-    want(18,95,"WAITING FOR INTERACTIVE SSH",LIVE_TERMINAL_FG);
-    if(pin&&*pin){
-        want(18,145,"SSH HOST KEY SHA256 HEX",LIVE_TERMINAL_FG);want(18,172,pin,LIVE_TERMINAL_FG);
-    }
-    want(18,523,"TRIANGLE REVIEW UPDATE / SELECT REVOKES / START EXITS",LIVE_TERMINAL_FG);
+    want(18,37,"VITA AGENT WORKBENCH 2.0",LIVE_TERMINAL_FG);
+    want(755,37,online?"AGENT ONLINE":"AGENT READY",LIVE_TERMINAL_FG);
+    want(18,105,"AGENT-OPERATED MODE ACTIVE",LIVE_TERMINAL_FG);
+    want(18,145,"SSH AND SFTP 192.0.2.10:2222",LIVE_TERMINAL_FG);
+    want(18,180,"ZERO-BUTTON UPDATES ENABLED - WBQ2",LIVE_TERMINAL_FG);
+    want(18,215,"LIVE CONSOLE MIRRORS HERE WHEN CONNECTED",LIVE_TERMINAL_FG);
+    /* 02.18: the host key fingerprint is shown on the PC terminal only; the
+     * exact-pixel comparison below fails if any pin text is drawn. */
+    want(18,523,"SSH AND TURBO SFTP READY / START EXITS",LIVE_TERMINAL_FG);
     assert(memcmp(expected,pixels,sizeof pixels)==0);
     assert(!wb_mirror_active()&&!wb_mirror_row(0)[0]);
 }

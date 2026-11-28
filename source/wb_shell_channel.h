@@ -6,9 +6,13 @@
 #include "wb_tty_file.h"
 #endif
 
+enum { WB_SH_HIST = 32 };
+
 typedef struct wb_shell_channel {
     wb_shell_engine shell;
-    char line[WB_SH_LINE], pending[24576];
+    char line[WB_SH_LINE], pending[30720];
+    char hist[WB_SH_HIST][WB_SH_LINE];
+    unsigned hist_count, hist_nav;
 #ifdef WB_TTY_FILE
     uint8_t incoming[WB_TTY_LINE+2];
     wb_tty_file *file;
@@ -16,13 +20,15 @@ typedef struct wb_shell_channel {
 #else
     uint8_t incoming[256];
 #endif
-    size_t used, sent, queued, ri, rn;
+    size_t used, cursor, sent, queued, ri, rn;
 #ifdef WB_SCREEN_MIRROR
     unsigned cols,rows;
+    size_t clear_after;
     bool mirror_started; /* only after output committed on this admitted channel */
 #endif
     uint64_t game_owner;
-    unsigned escape;
+    unsigned escape, esc_len;
+    char esc_buf[8];
     bool echo, ignore_lf, bad_line, closing, overflow;
 } wb_shell_channel;
 

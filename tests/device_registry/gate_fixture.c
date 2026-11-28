@@ -93,6 +93,9 @@ static int capture(void *c,const char *s,size_t n){(void)c;assert(n<sizeof reply
 static bool quick_barrier(void){return true;}
 static int wb_arm_issue(const char *job,const char *cse){assert(job&&cse);jobs++;return WB_OK;}
 static int wb_arm_cancel(void){return WB_OK;}
+#include "../large_app_native/file_spool_fixture.h"
+static int fixture_app_budget(uint64_t required,wb_out *out){(void)out;assert(required>0);return WB_OK;}
+#define WB_APP_BUDGET(required,out) fixture_app_budget(required,out)
 #include "wb_app_gate_impl.h"
 static unsigned char *load(const char *p,size_t *n){
     FILE *f=fopen(p,"rb");assert(f);assert(fseek(f,0,SEEK_END)==0);long pos=ftell(f);assert(pos>0 && pos<1000000);

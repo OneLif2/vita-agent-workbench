@@ -7,7 +7,7 @@
 
 #include "wb_zip.h"
 
-typedef struct { int fd; } wb_vfile;
+typedef struct { int fd; uint64_t pos; bool pos_valid; } wb_vfile;
 
 typedef struct {
     char root[128];

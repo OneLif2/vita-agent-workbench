@@ -15,25 +15,40 @@ typedef int SceIoStat;typedef size_t SceSize;typedef int64_t SceOff;
 typedef struct {int fd;} wb_vfile;
 enum {SCE_SEEK_SET=0,SCE_SEEK_END=2,SCE_O_RDONLY=1};
 static struct {char run_hex[17];} a={"1234567890abcdef"};
-static struct F {char name[128];uint8_t b[256];size_t n,pos;int isdir;} fs[24];
+#ifndef WB_TEST_FS_CAP
+#define WB_TEST_FS_CAP 256
+#endif
+static struct F {char name[128];uint8_t b[WB_TEST_FS_CAP];size_t n,pos;int isdir;} fs[24];
 static int replacing,shortage,damage,io_writes,io_removes;
+/* Test-only syscall faults; armed only after the private file is open. */
+static int inject_write,inject_step,inject_close,inject_remove,inject_sync;
 static int find(const char *p){for(int i=1;i<24;i++)if(!strcmp(fs[i].name,p))return i;return -1;}
 static int make(const char *p){int i=find(p);if(i<0){for(i=1;i<24;i++)if(!*fs[i].name)break;}assert(i<24);memset(&fs[i],0,sizeof fs[i]);strcpy(fs[i].name,p);return i;}
 static int sceIoGetstat(const char *p,SceIoStat *s){(void)s;return find(p)<0?(int)0x80010002:0;}
 static int sceIoOpen(const char *p,int flags,int mode){(void)flags;(void)mode;int f=find(p);if(f>=0)fs[f].pos=0;return f;}
-static int sceIoClose(int f){return f>0?0:-1;}
+static int sceIoClose(int f){return inject_close?inject_close:f>0?0:-1;}
 static int sceIoMkdir(const char *p,int mode){(void)mode;if(find(p)>=0)return (int)0x80010011;fs[make(p)].isdir=1;return 0;}
-static int sceIoSyncByFd(int f,int flag){(void)flag;if(damage)fs[f].b[0]^=1;return 0;}
+static int sceIoSyncByFd(int f,int flag){(void)flag;if(damage)fs[f].b[0]^=1;return inject_sync;}
 static int sceIoRead(int f,void *b,size_t n){if(n>fs[f].n-fs[f].pos)n=fs[f].n-fs[f].pos;memcpy(b,fs[f].b+fs[f].pos,n);fs[f].pos+=n;return (int)n;}
-static int sceIoWrite(int f,const void *b,size_t n){++io_writes;assert(fs[f].pos+n<=sizeof fs[f].b);memcpy(fs[f].b+fs[f].pos,b,n);fs[f].pos+=n;fs[f].n=fs[f].pos;return (int)n;}
+static int sceIoWrite(int f,const void *b,size_t n){++io_writes;
+    if(inject_write==1){if(inject_step++)return (int)0x80010005u;if(n>2)n=2;}
+    if(inject_write==2)return 0;
+    if(inject_write==3)return (int)n+1;
+    if(inject_write==4&&n>1)n=1;
+    assert(fs[f].pos+n<=sizeof fs[f].b);memcpy(fs[f].b+fs[f].pos,b,n);fs[f].pos+=n;fs[f].n=fs[f].pos;return (int)n;}
 static SceOff sceIoLseek(int f,SceOff n,int whence){fs[f].pos=(size_t)(whence==SCE_SEEK_END?(SceOff)fs[f].n+n:n);return (SceOff)fs[f].pos;}
-static int sceIoRemove(const char *p){++io_removes;int f=find(p);if(f<0)return -1;memset(&fs[f],0,sizeof fs[f]);return 0;}
+static int sceIoRemove(const char *p){++io_removes;if(inject_remove)return inject_remove;int f=find(p);if(f<0)return -1;memset(&fs[f],0,sizeof fs[f]);return 0;}
 static int sceIoRename(const char *a,const char *b){int f=find(a),q=find(b);if(f<0)return -1;if(q>0){if(!replacing)return (int)0x80010011;sceIoRemove(b);}strcpy(fs[f].name,b);return 0;}
 static int open_staging(const char *p,int *rc){(void)rc;return make(p);}
 static int wb_vita_read_small(const char *p,void *b,size_t cap,size_t *n){int f=sceIoOpen(p,1,0);if(f<0)return -1;*n=(size_t)sceIoRead(f,b,cap);return 0;}
 static int wb_vita_mkdir_p(const char *p){(void)p;return 0;}
 static int wb_ux0_budget(uint64_t n,wb_out *out,bool show){(void)n;(void)out;(void)show;return shortage?WB_E_LIMIT:WB_OK;}
-static int write_upload_chunk(int f,const uint8_t *p,size_t n){return sceIoWrite(f,p,n)==(int)n?WB_OK:WB_E_IO;}
+/* Mirror 02.11 write_upload_chunk for dual-version comparison of the same
+ * adapter fixture. 02.12 reads the raw syscall return instead. */
+static inline int write_upload_chunk(int f,const uint8_t *p,size_t n){
+    for(size_t off=0;off<n;){int k=sceIoWrite(f,p+off,n-off);if(k<=0||(size_t)k>n-off)return WB_E_IO;off+=(size_t)k;}
+    return WB_OK;
+}
 static int ra(const void *ctx,uint64_t off,void *dst,size_t n){int f=((wb_vfile *)ctx)->fd;sceIoLseek(f,(SceOff)off,0);return sceIoRead(f,dst,n)==(int)n?WB_OK:WB_E_IO;}
 static int wb_vita_reader_open(const char *p,wb_reader *r,wb_vfile *f){f->fd=find(p);if(f->fd<0)return -1;r->ctx=f;r->size=fs[f->fd].n;r->read_at=ra;return 0;}
 static void wb_vita_reader_close(wb_vfile *f){f->fd=-1;}
@@ -46,6 +61,11 @@ static int st(void *c,const char *p,wb_sftp_attr *a){
 }
 static int op(void *c,const char *p,int dir,int *f){(void)c;(void)dir;char path[150];snprintf(path,sizeof path,WB_INCOMING "%s",p);*f=sceIoOpen(path,1,0);return *f<0?2:0;}
 const wb_sftp_ops wb_sftp_vita_ops={.stat=st,.open=op};
+#ifndef WB_TEST_GAME_LOG_API_CUSTOM
+/* Legacy transfer fixtures grant no new game-log access. The dedicated
+ * game_logs_tty fixture injects its own checked-read API contract. */
+int wb_vita_shell_open_game_log(const char *p,int *fd){(void)p;if(fd)*fd=-1;return -1;}
+#endif
 #include "wb_tty_vita.inc"
 static int private_count(void){int n=0;for(int i=1;i<24;i++)n+=strstr(fs[i].name,"/tty-")!=NULL;return n;}
 static int result_read_cli(void){
@@ -72,6 +92,14 @@ int main(int argc,char**argv){ (void)&wb_s2_selftest;
     assert(wb_tty_vopen(false,"ux0:/data/INAP00018/testapp/../secret",0,&h,&n)&&!h);
     shortage=1;assert(!strcmp(wb_tty_vopen(true,p,3,&h,&n),"no-space"));shortage=0;
     replacing=1;assert(!strcmp(wb_tty_vopen(true,p,3,&h,&n),"no-clobber-unavailable"));replacing=0;assert(!private_count());
+    /* Boundary-only mock metadata, not a claim of actual multi-GiB transfer. */
+    assert(!wb_tty_vopen(true,p,UINT64_C(201326593),&h,&n)&&n==UINT64_C(201326593));
+    assert(!wb_tty_vfinish(h,false,NULL)&&!private_count());
+    assert(!wb_tty_vopen(true,p,WB_TRANSFER_MAX,&h,&n)&&n==WB_TRANSFER_MAX);
+    assert(!wb_tty_vfinish(h,false,NULL)&&!private_count());
+    assert(!strcmp(wb_tty_vopen(true,p,WB_TRANSFER_MAX+1u,&h,&n),"bad-size")&&!h);
+    puts("PASS native PUT metadata: removed192MiB quota, uint32 maximum admitted, uint32+1 refused before create (no huge payload)");
+
     assert(!wb_tty_vopen(true,p,3,&h,&n)&&n==3);
     assert(!wb_tty_vwrite(h,abc,3)&&!wb_tty_vfinish(h,false,NULL)&&!private_count()&&find(p)<0);
     assert(!wb_tty_vopen(true,p,3,&h,&n));assert(!wb_tty_vwrite(h,abc,3));damage=1;
@@ -145,4 +173,5 @@ int main(int argc,char**argv){ (void)&wb_s2_selftest;
     puts("PASS exact wake-probe/result.bin GET only: 256-byte read, readonly handle, 13 job/private/sibling/traversal negatives x5 operations, tree/mkdir/PUT/stream denied and no unlink/write");
     puts("PASS tree and stream: canonical parents, no-merge mkdir, empty file, shortage, verified streaming SHA and replaced parent refused");
     puts("PASS native adapter: no-space, path scope, no-clobber capability, destination race, abort cleanup, corrupt readback, verified publish, bounded incoming/diagnostic reads (mock Vita filesystem)");
+    return 0;
 }

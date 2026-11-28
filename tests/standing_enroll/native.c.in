@@ -1,0 +1,224 @@
+#include <assert.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#include <psp2/apputil.h>
+#include <psp2/io/stat.h>
+#include <psp2/rtc.h>
+#include "wb_return_policy.h"
+#include "wb_standing_provision.h"
+#include "startup_power.h"
+#include "focus_guard.h"
+#undef WB_VERSION
+#define WB_VERSION active_version
+#define WB_STANDING_VERIFY_H
+static const char *active_version="02.08";
+static struct {char pin[65],user_pin[65];const char *run_hex;unsigned power_calls;bool remote_start,power_latched;unsigned power_event;uint64_t rtc_last;uint32_t app_event,sys_event;} a;
+static struct {void *session;bool authenticated;} g_ssh;
+static bool r1_bound;
+static wb_r1_ticket r1_completed;
+static uint64_t mono,wall;
+static unsigned frames,reads,writes,auto_ticks,oled_ticks,assertions,cases,receipt_reads;
+static bool focus_ok,fail_save,fail_read,lie_save,corrupt_read,fail_log,fail_frame,receipt_fail,low,suspend;
+static int pad_rc;
+static unsigned fail_pad_at;
+static bool unknown_storage,reverse_mono,reverse_wall,expire_after_delay,late_receipt,late_host,slow_receipt;
+static bool late_focus,late_low;
+static bool generation_ui,generation_hash,generation_save,zero_tick;
+static int ac,callback_rc,app_rc,rtc_rc,overlay_reads;
+typedef struct {
+    int cb,app_rc,rtc_rc;uint32_t power;bool power_latched;
+    struct {uint32_t appEventNum,systemEventNum;bool isSystemUiOverlaid;} state;
+    SceRtcTick tick;
+} FocusEvidence;
+static const char *fail_log_contains;
+static unsigned sequence[8],sequence_len;
+static char installed[WBQ_CAP],last_log[192];
+static unsigned char storage[512];static size_t storage_len;
+enum {SCE_CTRL_CROSS=1,SCE_CTRL_START=2,SCE_CTRL_SELECT=4,
+      SCE_KERNEL_POWER_TICK_DISABLE_AUTO_SUSPEND=1,SCE_KERNEL_POWER_TICK_DISABLE_OLED_OFF=4};
+typedef struct {unsigned buttons;} SceCtrlData;
+#define CHECK(x) do {assert(x);assertions++;} while(0)
+static uint64_t now_ms(void){return mono;}
+static uint64_t r1_now(void){return wall;}
+static FocusEvidence read_focus(void){
+    FocusEvidence e={.cb=callback_rc,.app_rc=app_rc,.rtc_rc=rtc_rc,
+        .power=a.power_event,.power_latched=a.power_latched,
+        .state={0,0,!focus_ok||overlay_reads>0||(late_focus&&reads)},.tick={zero_tick?0:wall}};
+    if(overlay_reads>0)overlay_reads--;
+    return e;
+}
+static void capture_focus(const FocusEvidence *e){
+    a.rtc_last=e->tick.tick;a.app_event=e->state.appEventNum;a.sys_event=e->state.systemEventNum;
+}
+static bool foreground(bool capture){
+    assert(!capture);const FocusEvidence e=read_focus();
+    FocusResult r=focus_result(e.cb,e.power_latched?1u:e.power,e.app_rc,e.state.isSystemUiOverlaid,
+        e.rtc_rc,e.tick.tick,false,a.app_event==e.state.appEventNum&&a.sys_event==e.state.systemEventNum,a.rtc_last);
+    if(r!=FG_OK)return false;
+    a.rtc_last=e.tick.tick;return true;
+}
+static bool r1_get(const char*,void*,size_t);
+static int r1_exists(const char*);
+static bool log_event(const char *s){
+    snprintf(last_log,sizeof last_log,"%s",s);
+    return !fail_log&&(!fail_log_contains||!strstr(s,fail_log_contains));
+}
+static const char *wb_standing_key_id(void){return WB_STANDING_SIGNER;}
+static bool wb_standing_provisioned(const char *h,const char *o){
+    char hn[65],on[65];return wb_r1_normal_pin(hn,h)&&wb_r1_normal_pin(on,o)&&
+        wb_r1_pin_equal(hn,WB_STANDING_HOST)&&wb_r1_pin_equal(on,WB_STANDING_OWNER);
+}
+static int wq_installed_receipt(const char *p,const char *v,char *out){
+    assert(!strcmp(p,"ux0:app/" WB_TITLE_ID));assert(!strcmp(v,active_version));
+    receipt_reads++;
+    if(receipt_reads==2){
+        if(late_receipt)installed[20]='a';
+        if(late_host)a.pin[0]^=1;
+        if(slow_receipt){mono+=60000;wall+=UINT64_C(60000000);}
+        if(generation_hash)a.power_calls++;
+    }
+    if(receipt_fail)return WB_E_IO;
+    strcpy(out,installed);return WB_OK;
+}
+static int sceCtrlPeekBufferPositive(int port,SceCtrlData *p,int count){
+    assert(!port&&count==1);p->buttons=sequence[reads<sequence_len?reads:sequence_len-1];reads++;
+    return fail_pad_at&&reads==fail_pad_at?0:pad_rc;
+}
+static int sceKernelPowerTick(int flags){assert(flags==1||flags==4||flags==5);if(flags&1)auto_ticks++;if(flags&4)oled_ticks++;return 0;}
+static int sceKernelDelayThread(unsigned us){
+    if(reverse_mono)mono=0;else mono+=us/1000;
+    if(reverse_wall)wall--;else wall+=us;
+    if(expire_after_delay)wall=r1_completed.expires;
+    return 0;
+}
+static int scePowerIsLowBattery(void){return low||(late_low&&reads);}
+static int scePowerIsSuspendRequired(void){return suspend;}
+static int scePowerIsPowerOnline(void){return ac;}
+static int display_frame_prompt(const char *label,const char *pin,int d,const char *hint){
+    (void)pin;assert(!d&&hint);assert(!strcmp(label,"ENABLE AUTOMATIC UPDATES FOR PAIRED PC"));
+    frames++;if(generation_ui&&frames==1)a.power_calls++;return !fail_frame;
+}
+#include "standing_under_test.inc"
+#include "settle_under_test.inc"
+static bool r1_get(const char *p,void *b,size_t n){
+    assert(!strcmp(p,WB_STANDING_PATH));if(fail_read||n!=storage_len)return false;
+    memcpy(b,storage,n);if(corrupt_read)((unsigned char*)b)[0]^=1;return true;
+}
+static int r1_exists(const char *p){assert(!strcmp(p,WB_STANDING_PATH));return unknown_storage?-1:(storage_len?1:0);}
+int sceAppUtilSaveDataDataSave(SceAppUtilSaveDataFileSlot *slot,SceAppUtilSaveDataFile *f,
+                             unsigned n,SceAppUtilSaveDataMountPoint *mount,SceSize *needed){
+    assert(!slot&&!mount&&needed&&n==1&&!strcmp(f->filePath,WB_STANDING_NAME));
+    assert(f->bufSize==sizeof(wb_standing_disk));writes++;
+    if(generation_save&&writes==1)a.power_calls++;
+    if(fail_save)return -1;
+    if(!lie_save){storage_len=f->bufSize;memcpy(storage,f->buf,storage_len);}return 0;
+}
+static wb_r1_ticket reset(void){
+    memset(&a,0,sizeof a);memset(&g_ssh,0,sizeof g_ssh);memset(storage,0,sizeof storage);storage_len=0;
+    memset(sequence,0,sizeof sequence);sequence[1]=SCE_CTRL_CROSS;sequence[2]=0;sequence_len=3;
+    mono=100;wall=UINT64_C(100000000);active_version="02.08";a.run_hex="CDCDCDCDCDCDCDCD";
+    frames=reads=writes=auto_ticks=oled_ticks=receipt_reads=0;focus_ok=true;pad_rc=1;
+    fail_pad_at=0;unknown_storage=reverse_mono=reverse_wall=expire_after_delay=late_receipt=late_host=slow_receipt=false;
+    late_focus=late_low=false;fail_log_contains=NULL;
+    generation_ui=generation_hash=generation_save=zero_tick=false;
+    ac=1;callback_rc=app_rc=rtc_rc=overlay_reads=0;a.power_calls=1;
+    a.rtc_last=wall;
+    fail_save=fail_read=lie_save=corrupt_read=fail_log=fail_frame=receipt_fail=low=suspend=false;
+    last_log[0]=0;standing_disabled_this_run=false;r1_bound=true;
+    CHECK(wb_r1_normal_pin(a.pin,WB_STANDING_HOST));CHECK(wb_r1_normal_pin(a.user_pin,WB_STANDING_OWNER));
+    snprintf(installed,sizeof installed,"WBQ2 02.08 %064x 1234567\n",13);
+    wb_r1_ticket t={0};CHECK(wb_r1_make(&t,wall-1000,"02.06","2C32CAE1C6F0948C",
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",a.user_pin,a.pin,installed));r1_completed=t;return t;
+}
+static void seed(const wb_r1_ticket *t,int kind){
+    wb_standing_disk r={.magic="WBS1-01",.permit=WB_STANDING_ACTIVE};
+    memcpy(r.key,wb_standing_key_id(),65);memcpy(r.host,t->host_pin,65);memcpy(r.owner,t->owner_pin,65);
+    memcpy(r.source_run,t->source_run,17);memcpy(r.nonce,t->nonce,33);
+    if(kind==1){memset(&r,0,sizeof r);memcpy(r.magic,"WBS1-01",8);r.permit=WB_STANDING_REVOKED;}
+    if(kind==2)r.key[0]^=1;
+    memcpy(storage,&r,sizeof r);storage_len=sizeof r;
+}
+static void no_write(wb_r1_ticket *t){
+    unsigned char prior[sizeof storage];memcpy(prior,storage,sizeof prior);size_t n=storage_len;
+    CHECK(!wb_standing_reenroll_local(t));CHECK(!writes&&storage_len==n&&!memcmp(storage,prior,sizeof prior));cases++;
+}
+int main(void){
+    wb_r1_ticket t=reset();CHECK(wb_standing_reenroll_local(&t));CHECK(writes==1&&frames>=2&&reads>=2);
+    wb_standing_disk got={0};CHECK(wb_standing_active(&got));CHECK(!strcmp(got.source_run,t.source_run)&&!strcmp(got.nonce,t.nonce));
+    CHECK(auto_ticks&&oled_ticks);cases++;
+    for(int kind=1;kind<=2;kind++){t=reset();seed(&t,kind);CHECK(wb_standing_reenroll_local(&t));CHECK(writes==1&&wb_standing_active(&got));cases++;}
+    t=reset();seed(&t,0);CHECK(wb_standing_reenroll_local(&t));CHECK(!writes&&!frames&&!reads);cases++;
+    t=reset();r1_bound=false;no_write(&t);
+    t=reset();g_ssh.session=(void *)(uintptr_t)1;no_write(&t);
+    t=reset();a.run_hex=t.source_run;no_write(&t);
+    t=reset();no_write(NULL);
+    t=reset();active_version="02.09";no_write(&t);
+    t=reset();memcpy(t.source_ver,"02.05",6);r1_completed=t;no_write(&t);
+    t=reset();memcpy(t.target_ver,"02.09",6);r1_completed=t;no_write(&t);
+    t=reset();t.nonce[0]='B';no_write(&t);
+    t=reset();a.pin[0]^=1;no_write(&t);
+    t=reset();a.user_pin[0]^=1;no_write(&t);
+    t=reset();wall=t.expires;no_write(&t);
+    t=reset();receipt_fail=true;no_write(&t);
+    t=reset();unknown_storage=true;no_write(&t);
+    t=reset();installed[20]='a';no_write(&t);
+    t=reset();focus_ok=false;no_write(&t);
+    t=reset();pad_rc=0;no_write(&t);
+    t=reset();pad_rc=-1;no_write(&t);
+    t=reset();sequence[0]=SCE_CTRL_START;no_write(&t);
+    t=reset();sequence[1]=SCE_CTRL_SELECT;no_write(&t);
+    t=reset();sequence[2]=SCE_CTRL_SELECT;no_write(&t);
+    t=reset();fail_pad_at=3;no_write(&t);
+    t=reset();sequence[0]=sequence[1]=sequence[2]=SCE_CTRL_CROSS;no_write(&t);CHECK(mono>=60100);
+    t=reset();memset(sequence,0,sizeof sequence);no_write(&t);CHECK(mono>=60100);
+    t=reset();fail_frame=true;no_write(&t);
+    t=reset();fail_log=true;no_write(&t);
+    t=reset();fail_log_contains="PHYSICAL CROSS ACCEPTED";no_write(&t);
+    t=reset();low=true;no_write(&t);
+    t=reset();suspend=true;no_write(&t);
+    t=reset();reverse_mono=true;no_write(&t);
+    t=reset();reverse_wall=true;no_write(&t);
+    t=reset();expire_after_delay=true;no_write(&t);
+    t=reset();late_receipt=true;no_write(&t);CHECK(receipt_reads==2);
+    t=reset();late_host=true;no_write(&t);CHECK(receipt_reads==2);
+    t=reset();slow_receipt=true;no_write(&t);CHECK(receipt_reads==2);
+    t=reset();late_focus=true;no_write(&t);
+    t=reset();late_low=true;no_write(&t);
+    t=reset();fail_save=true;CHECK(!wb_standing_reenroll_local(&t));CHECK(writes==2&&standing_disabled_this_run);cases++;
+    t=reset();lie_save=true;CHECK(!wb_standing_reenroll_local(&t));CHECK(writes==2&&standing_disabled_this_run);cases++;
+    t=reset();corrupt_read=true;CHECK(!wb_standing_reenroll_local(&t));CHECK(writes==2&&standing_disabled_this_run);cases++;
+    t=reset();fail_read=true;CHECK(!wb_standing_reenroll_local(&t));CHECK(writes==2&&standing_disabled_this_run);cases++;
+    t=reset();fail_log_contains="ENABLED VERIFIED";CHECK(!wb_standing_reenroll_local(&t));
+    CHECK(writes==2&&standing_disabled_this_run&&wb_standing_revoked());CHECK(!wb_standing_active(&got));cases++;
+    t=reset();standing_disabled_this_run=true;seed(&t,1);CHECK(wb_standing_reenroll_local(&t));
+    CHECK(!standing_disabled_this_run&&writes==1&&wb_standing_active(&got));cases++;
+    /* Exercise the existing production bounded settle itself. Registration
+     * callbacks are observations, never the enrollment gesture. */
+    for(unsigned power=0;power<2;power++){
+        t=reset();a.power_latched=true;a.power_event=power?0x1080:0;
+        CHECK(wb_standing_reenroll_local(&t));
+        CHECK(writes==1&&frames>=2&&reads>=2&&mono>=136);
+        CHECK(!a.power_event&&!a.power_latched&&a.power_calls==1&&wb_standing_active(&got));cases++;
+    }
+    t=reset();ac=0;a.power_latched=true;a.power_event=0x180;
+    CHECK(wb_standing_reenroll_local(&t));CHECK(writes==1&&wb_standing_active(&got));cases++;
+    t=reset();overlay_reads=2;CHECK(wb_standing_reenroll_local(&t));CHECK(writes==1&&frames>=2&&mono>=156);cases++;
+    t=reset();a.power_latched=true;a.power_event=0x1000;no_write(&t);CHECK(!frames&&!reads);
+    t=reset();a.power_latched=true;a.power_event=0x2080;no_write(&t);CHECK(!frames&&!reads);
+    t=reset();a.power_latched=true;a.power_event=0x80;no_write(&t);CHECK(!frames&&!reads);
+    t=reset();a.power_latched=true;a.power_event=0x1080;low=true;no_write(&t);CHECK(!frames&&!reads);
+    t=reset();a.power_latched=true;a.power_event=0x1080;suspend=true;no_write(&t);CHECK(!frames&&!reads);
+    t=reset();callback_rc=-1;no_write(&t);CHECK(!frames&&!reads);
+    t=reset();app_rc=-1;no_write(&t);CHECK(!frames&&!reads);
+    t=reset();rtc_rc=-1;no_write(&t);CHECK(!frames&&!reads);
+    t=reset();zero_tick=true;no_write(&t);CHECK(!frames&&!reads);
+    t=reset();focus_ok=false;no_write(&t);CHECK(!frames&&!reads&&mono==6100);
+    t=reset();generation_ui=true;no_write(&t);CHECK(frames==1&&reads==1);
+    t=reset();generation_hash=true;no_write(&t);CHECK(receipt_reads==2);
+    t=reset();generation_save=true;CHECK(!wb_standing_reenroll_local(&t));
+    CHECK(writes==2&&standing_disabled_this_run&&wb_standing_revoked()&&!wb_standing_active(&got));cases++;
+    printf("PASS %u actual local standing-enrollment cases, %u assertions: production bounded focus settle, physical neutral/CROSS, return/receipt/pin gates, generation fence and native-save readback; host stubs, no Vita\n",cases,assertions);
+    return 0;
+}

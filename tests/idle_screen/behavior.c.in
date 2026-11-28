@@ -1,0 +1,59 @@
+#include <assert.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "wb_idle_screen.h"
+#include "wb_ssh.h"
+#include "wb_shell_channel.h"
+enum { SCE_TOUCH_PORT_FRONT=0,SCE_TOUCH_PORT_BACK=1,
+       SCE_KERNEL_POWER_TICK_DISABLE_AUTO_SUSPEND=1,
+       SCE_KERNEL_POWER_TICK_DISABLE_OLED_OFF=4 };
+typedef struct {unsigned buttons;unsigned char lx,ly,rx,ry;} SceCtrlData;
+typedef struct {unsigned reportNum;} SceTouchData;
+static struct {bool resilient;uint64_t guard_grace,absorb_last;} a={.resilient=true};
+static wb_ssh g_ssh;
+static uint64_t clock_ms;
+static unsigned off_calls,auto_ticks,oled_ticks,ended;
+static bool connected=true;
+uint64_t now_ms(void){return clock_ms;}
+void absorb_focus(void){}
+int sceTouchPeek(int port,SceTouchData *p,int count){assert((port==0||port==1)&&count==1);p->reportNum=0;return 1;}
+int sceKernelPowerTick(int flag){
+    assert(flag==1||flag==4);if(flag==1)auto_ticks++;else oled_ticks++;return 0;
+}
+int scePowerRequestDisplayOff(void){off_calls++;return 0;}
+int scePowerRequestDisplayOn(void){return 0;}
+bool log_event(const char *s){assert(s);return true;}
+int ssh_channel_is_closed(struct ssh_channel_struct *c){assert(c);return 0;}
+int ssh_channel_is_eof(struct ssh_channel_struct *c){assert(c);return 0;}
+bool wb_ssh_connected(const wb_ssh *s){return s&&s->session&&connected;}
+void fail(wb_ssh *s,const char *why){(void)s;assert(why);}
+void wb_ssh_end_session(wb_ssh *s){ended++;s->authenticated=false;}
+ACTUAL_IDLE_ADAPTER
+ACTUAL_INTERACTIVE_KEEP
+static int deadline_check(wb_ssh *s,uint64_t t){
+ACTUAL_DEADLINE_CHECKS
+    return 0;
+}
+static void screen_tick(uint64_t mono){
+    SceCtrlData pad={.lx=128,.ly=128,.rx=128,.ry=128};
+    (void)pad;clock_ms=mono;
+ACTUAL_SCREEN_TICK
+}
+int main(int argc,char **argv){
+    assert(argc==2);uint64_t at=strtoull(argv[1],NULL,10);assert(at==900000);
+    wb_shell_channel shell={0};
+    g_ssh=(wb_ssh){.authenticated=true,.kex=true,.shell_pty=true,
+        .session=(struct ssh_session_struct *)(uintptr_t)1,
+        .channel=(struct ssh_channel_struct *)(uintptr_t)2,.shell=&shell,
+        .kex_deadline=8000,.auth_deadline=90000,.idle_deadline=1800000,
+        .mode={.mode=MODE_B_KEY,.accepted=true,.pin={1}}};
+    screen_tick(0);screen_tick(at);
+    (void)deadline_check(&g_ssh,at);
+    printf("HOST_FIXTURE at_ms=%llu display=%s off_calls=%u oled_ticks=%u auto_suspend_ticks=%u authenticated_pty=%s\n",
+        (unsigned long long)at,off_calls?"off-request-accepted":"kept-awake",off_calls,oled_ticks,auto_ticks,
+        !ended&&g_ssh.authenticated?"retained":"ended");
+    return 0;
+}

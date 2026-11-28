@@ -79,6 +79,7 @@ def main():
     PIN = 'HOST_SHA256'
     command = f'app approve {a.remote} {r:064x} {s:064x}'
     with w.paired_terminal() as t:
+        t.ch.settimeout(300)
         assert t.host_pin == PIN, 'pin changed'
         rows = flow.reply(t, command)
         if len(rows) > 1:

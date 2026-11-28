@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Read-only Workbench 02.06 foreground health check constants and legacy CLI.
+"""Read-only Workbench 02.10 foreground health check constants and legacy CLI.
 Requires an already armed Workbench. No shell, launch, autoarm, installation, or reconnect.
 A successful report is about Workbench only, NOT a TestApp job or a lock-screen test.
 """
@@ -18,8 +18,8 @@ from pathlib import Path
 COMMANDS = ("ver", "status", "ver")
 POWER_COMMANDS = ("ver", "status", "ext sys", "ver")
 PAYLOAD = "01.22-p2.1"
-VERSION = "02.06"
-BUILD = "02.06-live-safequery"
+VERSION = "02.10"
+BUILD = "02.10-live-gamelogs"
 PORT = 2222
 MAX_REPLY = 2048
 TOTAL_TIMEOUT = 25

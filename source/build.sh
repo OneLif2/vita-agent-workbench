@@ -1,5 +1,5 @@
 #!/bin/sh
-# Builds Workbench v2.06 (SFO 02.06): the eboot core, the live-swappable payload and the
+# Builds Workbench v2.21 (SFO 02.21): the eboot core, the live-swappable payload and the
 # update VPK. Requires a VitaSDK with the libssh/mbedtls inputs 01.09 used.
 #
 #   VITASDK=/path/to/vitasdk \
@@ -23,18 +23,18 @@ mkdir -p "$b"
 echo "== validate owner App registry (compiled into core; not writable over SSH)"
 python3 -B ../tools/gen_app_registry.py "$b/registry-generated/wb_registry_data.inc"
 
-cflags="-std=c11 -DWITH_SERVER -Wall -Wextra -Werror -Wno-deprecated-declarations -Os"
+cflags="-std=c11 -DWITH_SERVER -DWB_SHELL2 -Wall -Wextra -Werror -Wno-deprecated-declarations -Wno-unused-function -Os -mcpu=cortex-a9 -mtune=cortex-a9"
 cflags="$cflags -I. -I$libssh_include -I$libssh_include2 -I$mbed_include"
 
 core_src="vita_ssh_status.c display.c startup.c
-wb_err.c wb_str.c wb_sha256.c wb_sha1.c wb_crc32.c wb_inflate.c wb_zip.c
+wb_err.c wb_str.c wb_sha1.c wb_crc32.c wb_inflate.c wb_zip.c
 wb_sfo.c wb_head.c wb_path.c wb_out.c wb_payload.c wb_cmd.c wb_install.c
 wb_ssh.c wb_shell.c wb_shell_channel.c wb_tty_file.c wb_shell_vfs.c wb_sftp_ro.c wb_sftp_vita.c wb_sftp_frame.c wb_photo_gate.c wb_vita_photo.c wb_vita_io.c wb_vita_install.c wb_vita_payload.c wb_updater.c wb_timeline.c
 ../unsupported_vita_calls.c"
 
 stubs="-lSceGxm_stub -lSceDisplay_stub -lSceAppUtil_stub -lSceCommonDialog_stub
 -lSceNet_stub -lSceNetCtl_stub -lSceSysmodule_stub -lSceLibKernel_stub
--lSceAppMgr_stub -lSceIofilemgr_stub -lSceRtc_stub -lSceCtrl_stub -lScePower_stub
+-lSceAppMgr_stub -lSceIofilemgr_stub -lSceRtc_stub -lSceCtrl_stub -lSceTouch_stub -lScePower_stub
 -lScePromoterUtil_stub -lScePhotoExport_stub"
 
 for lib in $extra_libs; do stubs="$stubs -l$lib"; done
@@ -50,10 +50,13 @@ vita-pack-vpk -s "$b/updater/param.sfo" -b "$b/updater/eboot.bin" "$b/updater/up
 ( cd "$b" && arm-vita-eabi-ld -r -b binary -o updater_res.o updater/eboot.bin updater/param.sfo )
 
 echo "== core"
+# Compile wb_sha256.c at -O3 -funroll-loops for the core while keeping source/wb_sha256.c
+# byte-identical to the frozen INAP00019 helper epoch 01.74.
+arm-vita-eabi-gcc -std=c11 -Wall -Wextra -Werror -O3 -funroll-loops -mcpu=cortex-a9 -mtune=cortex-a9 -I. -c wb_sha256.c -o "$b/wb_sha256.o"
 # shellcheck disable=SC2086
 arm-vita-eabi-gcc -I"$b/registry-generated" $cflags \
   -Wl,-q,--defsym=__sce_headroom=0x1000,-Map,"$b/workbench.map" \
-  -DWB_STANDING_BOOTSTRAP=0 -DWB_GAME_FEATURE -DWB_SCREEN_MIRROR -DWB_TTY_FILE $core_src wb_game_vita.c wb_game_io.c wb_screen_mirror.c "$b/updater_res.o" "$libssh_archive" "$platform_object" libwbgame.a -lm -L"$mbed_lib" \
+  -DWB_STANDING_BOOTSTRAP=0 -DWB_GAME_FEATURE -DWB_SCREEN_MIRROR -DWB_TTY_FILE $core_src "$b/wb_sha256.o" wb_game_vita.c wb_game_io.c wb_screen_mirror.c "$b/updater_res.o" "$libssh_archive" "$platform_object" libwbgame.a -lm -L"$mbed_lib" \
   -lmbedcrypto -lpthread $stubs -o "$b/workbench.elf"
 
 echo "== payload"
@@ -108,10 +111,10 @@ b=pathlib.Path(sys.argv[1]).read_bytes()
 if hashlib.sha256(b).hexdigest()!="0e3a633929b7069a5a194c86bd92eb770515d1766101f597139af61b0a45a66b": raise SystemExit("unapproved payload image")
 PY
 echo "== package"
-vita-mksfoex -s TITLE_ID=INAP00018 -s APP_VER=02.06 'Vita Agent Workbench' "$b/param.sfo"
+vita-mksfoex -s TITLE_ID=INAP00018 -s APP_VER=02.21 'Vita Agent Workbench' "$b/param.sfo"
 vita-pack-vpk -s "$b/param.sfo" -b "$b/eboot.bin" \
   -a "$approved=workbench_payload.suprx" \
-  "$b/workbench_0206.vpk"
+  "$b/workbench_0221.vpk"
 
-ls -l "$b/eboot.bin" "$b/workbench_payload.suprx" "$b/workbench_0206.vpk"
-echo "== done: $b/workbench_0206.vpk"
+ls -l "$b/eboot.bin" "$b/workbench_payload.suprx" "$b/workbench_0221.vpk"
+echo "== done: $b/workbench_0221.vpk"

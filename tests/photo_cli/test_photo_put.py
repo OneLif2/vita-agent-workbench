@@ -61,6 +61,8 @@ class Peer:
             reply = (0, f"F {path} {len(self.files[path])}" if path in self.files else "ERR not-found")
         elif cmd == "put":
             _, path, length, expected = args
+            if isinstance(stdin_bytes,wbctl.wb_tree.FileSource):
+                stdin_bytes=stdin_bytes.path.read_bytes()  # small inert contract fixture only
             assert int(length) == len(stdin_bytes) and expected == "sha256=" + digest(stdin_bytes)
             if path in self.files:
                 reply = (1, "ERR destination-exists")

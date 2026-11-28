@@ -65,19 +65,29 @@ bool wb_vita_exists(const char *path) {
 }
 
 static int read_at(const void *ctx, uint64_t off, void *buf, size_t n) {
-    const wb_vfile *f = (const wb_vfile *)ctx;
-    if (sceIoLseek(f->fd, (SceOff)off, SCE_SEEK_SET) != (SceOff)off) return WB_E_IO;
+    wb_vfile *f = (wb_vfile *)(uintptr_t)ctx;
+    if (!f->pos_valid || f->pos != off) {
+        if (sceIoLseek(f->fd, (SceOff)off, SCE_SEEK_SET) != (SceOff)off) {
+            f->pos_valid = false;
+            return WB_E_IO;
+        }
+        f->pos = off;
+        f->pos_valid = true;
+    }
     size_t done = 0;
     while (done < n) {
         const int rc = sceIoRead(f->fd, (char *)buf + done, (SceSize)(n - done));
-        if (rc <= 0) return WB_E_IO;
+        if (rc <= 0) { f->pos_valid = false; return WB_E_IO; }
         done += (size_t)rc;
     }
+    f->pos += (uint64_t)n;
     return WB_OK;
 }
 
 int wb_vita_reader_open(const char *path, wb_reader *rd, wb_vfile *f) {
     if (!path || !rd || !f) return WB_E_ARG;
+    f->pos = 0;
+    f->pos_valid = false;
     f->fd = sceIoOpen(path, SCE_O_RDONLY, 0);
     if (f->fd < 0) return WB_E_IO;
     const SceOff size = sceIoLseek(f->fd, 0, SCE_SEEK_END);

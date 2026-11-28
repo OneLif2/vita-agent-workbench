@@ -50,6 +50,8 @@ const char *wb_cmd_name(wb_cmd_kind kind) {
         case WB_CMD_PENDING:    return "pending";
         case WB_CMD_S1_CHECK: return "s1-check";
         case WB_CMD_APPLY_CORE: return "apply-core";
+        case WB_CMD_TERM_LINUX: return "linux";
+        case WB_CMD_TERM_AGENT_APP: return "agent-app";
         case WB_CMD_BYE:        return "bye";
         case WB_CMD_EXT:        return "ext";
         default:                return "none";

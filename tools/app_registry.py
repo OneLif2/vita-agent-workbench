@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 from dataclasses import dataclass
 import hashlib
 import io
@@ -14,13 +15,15 @@ import struct
 import sys
 import zipfile
 import zlib
+import wb_tree
 
 REGISTRY = Path(__file__).resolve().with_name("apps.txt")
 TITLE = re.compile(r"[A-Z]{4}[0-9]{5}")
 VERSION = re.compile(r"[0-9]{2}\.[0-9]{2}")
 SHA = re.compile(r"[0-9a-f]{64}")
 CASE = re.compile(r"[a-z][a-z0-9-]{0,31}")
-MAX_VPK = 32 * 1024 * 1024  # scope of this first, small homebrew slice
+# Ordinary ZIP32 (ZIP64 sentinel is not an ordinary 32-bit size/offset).
+MAX_VPK = (1 << 32) - 2
 CORE_TITLES = {"INAP00018", "INAP00019"}
 
 
@@ -93,12 +96,25 @@ def load_registry(path: Path) -> dict[str, Entry]:
     return rows
 
 
-def read_identity(data: bytes) -> tuple[str, str]:
+def read_identity(data) -> tuple[str, str]:
     # Invoked only AFTER a whole-VPK hash matches a local registry entry.
-    with zipfile.ZipFile(io.BytesIO(data)) as z:
+    with zipfile.ZipFile(io.BytesIO(data) if isinstance(data, bytes) else data) as z:
         files = z.infolist()
+        demand(len(files) < 65535 and z.start_dir < 0xffffffff, "zip64-not-supported")
         names = set()
         for info in files:
+            demand(info.extract_version < 45 and
+                   max(info.file_size, info.compress_size, info.header_offset) < 0xffffffff,
+                   "zip64-not-supported")
+            # A forced ZIP64 member may have small decoded values. It is still
+            # outside the native installer's ordinary ZIP32 contract.
+            extra=info.extra
+            while extra:
+                demand(len(extra)>=4, "malformed-zip-extra")
+                tag,n=struct.unpack_from('<HH',extra)
+                demand(n<=len(extra)-4, "malformed-zip-extra")
+                demand(tag!=1, "zip64-not-supported")
+                extra=extra[4+n:]
             name = info.filename.casefold()
             demand(name not in names, "duplicate-zip-member")
             names.add(name)
@@ -131,27 +147,49 @@ def read_identity(data: bytes) -> tuple[str, str]:
     return identity["TITLE_ID"], identity["APP_VER"]
 
 
+@contextlib.contextmanager
+def approve_file(package: Path, case: str | None = None, *, registry: Path | None = None):
+    """Approve a private disk snapshot; registry override is fixture-only, not CLI."""
+    with contextlib.ExitStack() as stack:
+        try:
+            demand(case is None or CASE.fullmatch(case), "invalid-case")
+            rows = load_registry(REGISTRY if registry is None else registry)
+            # Preserve the local-drive guard without reading the package wholesale.
+            name=str(package)
+            demand(not name.startswith(("//", "\\\\")) and "://" not in name, "nonlocal-path")
+            if os.name == "nt":
+                import ctypes
+                drive=package.absolute().anchor
+                demand(drive and not drive.startswith("\\\\") and
+                       ctypes.windll.kernel32.GetDriveTypeW(drive) in (2,3,6), "nonlocal-drive")
+            source=stack.enter_context(wb_tree.file_snapshot(package, MAX_VPK))
+            digest=source.sha256
+            demand(digest in rows, "sha256-not-approved")
+            entry = rows[digest]
+            with wb_tree.checked_open(source.path, source.sig) as file:
+                title, version = read_identity(file)
+            demand((title, version) == (entry.title, entry.version), "package-identity-mismatch")
+            if case is not None:
+                demand(case in entry.cases, "case-not-approved")
+            facts={"status": "APPROVED_LOCAL_PLAN", "title_id": title, "app_ver": version,
+                   "bytes": source.size, "sha256": digest, "case": case,
+                   "install_only": not bool(entry.cases)}
+        except Denied:
+            raise
+        except (OSError, KeyError, ValueError, RuntimeError, NotImplementedError,
+                struct.error, zipfile.BadZipFile, EOFError, zlib.error) as exc:
+            raise Denied("unreadable-or-malformed-input") from exc
+        yield facts, source
+
+
 def approve(package: Path, case: str | None = None, *, registry: Path | None = None):
-    """Return approval and exactly the bytes checked. Registry override is for fixture injection, not CLI."""
-    try:
-        demand(case is None or CASE.fullmatch(case), "invalid-case")
-        rows = load_registry(REGISTRY if registry is None else registry)
-        raw = local_bytes(package, MAX_VPK)
-        digest = hashlib.sha256(raw).hexdigest()
-        demand(digest in rows, "sha256-not-approved")
-        entry = rows[digest]
-        title, version = read_identity(raw)
-        demand((title, version) == (entry.title, entry.version), "package-identity-mismatch")
-        if case is not None:
-            demand(case in entry.cases, "case-not-approved")
-        return {"status": "APPROVED_LOCAL_PLAN", "title_id": title, "app_ver": version,
-                "bytes": len(raw), "sha256": digest, "case": case,
-                "install_only": not bool(entry.cases)}, raw
-    except Denied:
-        raise
-    except (OSError, KeyError, ValueError, RuntimeError, NotImplementedError,
-            struct.error, zipfile.BadZipFile, EOFError, zlib.error) as exc:
-        raise Denied("unreadable-or-malformed-input") from exc
+    """Legacy bytes API for frozen small-package consumers; CLI uses approve_file."""
+    with approve_file(package, case, registry=registry) as (facts, source):
+        with wb_tree.checked_open(source.path, source.sig) as file:
+            raw=file.read(source.size+1)
+        demand(len(raw)==source.size and hashlib.sha256(raw).hexdigest()==source.sha256,
+               "input-changed-or-short")
+        return facts, raw
 
 
 def main(argv=None):
@@ -160,7 +198,8 @@ def main(argv=None):
     parser.add_argument("--case", help="also check a test case (omit for install-only)")
     args = parser.parse_args(argv)
     try:
-        verdict, _ = approve(args.vpk, args.case)
+        with approve_file(args.vpk, args.case) as (verdict, _):
+            pass
     except Denied as err:
         print(json.dumps({"status": "DENIED", "reason": str(err)}))
         return 2

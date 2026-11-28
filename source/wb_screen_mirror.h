@@ -28,5 +28,6 @@ void wb_mirror_follow(void);
 bool wb_mirror_browsing(void);
 unsigned wb_mirror_scroll_offset(unsigned visible_rows);
 const char *wb_mirror_view_row(unsigned screen_row,unsigned visible_rows);
+const uint8_t *wb_mirror_view_fg(unsigned screen_row,unsigned visible_rows);
 uint64_t wb_mirror_revision(void);
 #endif

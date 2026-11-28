@@ -48,6 +48,7 @@ static void enroll(void) {
     next_stage("01.85");
 }
 int main(void) {
+    (void)wb_standing_reenroll_local; /* This fixture does not exercise new UI. */
     if(!WB_STANDING_BOOTSTRAP){
         begin();wb_r1_ticket prev=sample_boot("01.82");
         /* Use a genuinely valid old transition as a stronger off-switch

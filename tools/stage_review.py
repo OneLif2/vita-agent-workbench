@@ -35,11 +35,12 @@ def package(args):
     return p
 def reply(t,cmd):
     t.command(cmd);out=[];size=0
+    rp=getattr(t,'root_prompt',w.ROOT_PROMPT)
     for _ in range(32):
         while not t.buf:t._more()
-        while len(t.buf)<len(w.ROOT_PROMPT) and w.ROOT_PROMPT.startswith(t.buf):t._more()
-        if t.buf.startswith(w.ROOT_PROMPT):
-            t.exact(w.ROOT_PROMPT);return [x for x in out if x]
+        while len(t.buf)<len(rp) and rp.startswith(t.buf):t._more()
+        if t.buf.startswith(rp):
+            t.exact(rp);return [x for x in out if x]
         line=t.line().decode('ascii');size+=len(line)
         need(size<=12288 and all(32<=ord(c)<127 or c=='\t' for c in line),'malformed terminal reply')
         out.append(line)

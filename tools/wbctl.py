@@ -28,7 +28,8 @@ import zipfile
 from pathlib import Path
 
 import wbctl_pty
-from app_registry import Denied, approve
+from app_registry import Denied, approve, approve_file
+import wb_tree
 import space_budget as space
 from check_in_place import BUILD as CORE_BUILD, VERSION as CORE_VERSION, Problem as CoreError, checked_ver, VR
 
@@ -40,11 +41,12 @@ TITLE_ID = "INAP00018"
 TESTAPP_ID = "INAP00020"
 JOBS_DIR = Path(__file__).resolve().parent.parent / "evidence" / "jobs"
 
-def ssh(cmd: str, timeout: float = 20.0, stdin_bytes: bytes | None = None) -> tuple[int, str]:
+def ssh(cmd: str, timeout: float = 20.0, stdin_bytes: bytes | wb_tree.FileSource | None = None,
+        *, progress_total: int | None = None) -> tuple[int, str]:
     """Compatibility result for an operation on a pinned interactive PTY (not SSH exec)."""
     if (HOST,str(PORT),USER)!=(wbctl_pty.t.HOST,str(wbctl_pty.t.PORT),wbctl_pty.t.USER):
         return 78,"ERR unpaired endpoint; refusing alternate transport"
-    return wbctl_pty.exchange(cmd,timeout,stdin_bytes)
+    return wbctl_pty.exchange(cmd,timeout,stdin_bytes,progress_total)
 
 
 # ---------------------------------------------------------------- sfo / vpk
@@ -87,24 +89,27 @@ def parse_sfo(data: bytes) -> dict[str, str]:
 
 
 def vpk_facts(path: Path) -> dict:
-    raw = path.read_bytes()
-    facts = {
-        "path": str(path),
-        "bytes": len(raw),
-        "sha256": hashlib.sha256(raw).hexdigest(),
-        "members": [],
-        "title_id": None,
-        "app_ver": None,
-        "title": None,
-    }
-    with zipfile.ZipFile(path) as z:
-        for info in z.infolist():
-            facts["members"].append({"name": info.filename, "size": info.file_size, "crc": f"{info.CRC:08X}"})
-        if "sce_sys/param.sfo" in z.namelist():
-            sfo = parse_sfo(z.read("sce_sys/param.sfo"))
-            facts["title_id"] = sfo.get("TITLE_ID")
-            facts["app_ver"] = sfo.get("APP_VER")
-            facts["title"] = sfo.get("TITLE")
+    with wb_tree.checked_open(path) as file:
+        before=os.fstat(file.fileno()); size=before.st_size
+        digest=wb_tree.file_digest(file,size); file.seek(0)
+        facts = {"path":str(path), "bytes":size, "sha256":digest,
+                 "members":[], "title_id":None, "app_ver":None, "title":None}
+        with zipfile.ZipFile(file) as z:
+            for info in z.infolist():
+                facts["members"].append({"name": info.filename, "size": info.file_size, "crc": f"{info.CRC:08X}"})
+            if "sce_sys/param.sfo" in z.namelist():
+                info=z.getinfo("sce_sys/param.sfo")
+                if not 20<=info.file_size<=65536 or info.flag_bits&1:
+                    raise ValueError("invalid-sfo-size")
+                with z.open(info) as source:
+                    data=source.read(65537)
+                if len(data)!=info.file_size: raise ValueError("invalid-sfo-size")
+                sfo = parse_sfo(data)
+                facts["title_id"] = sfo.get("TITLE_ID")
+                facts["app_ver"] = sfo.get("APP_VER")
+                facts["title"] = sfo.get("TITLE")
+        if wb_tree.signature(os.fstat(file.fileno()))!=wb_tree.signature(before):
+            raise ValueError('source changed during package analysis')
     return facts
 
 
@@ -378,10 +383,14 @@ def cmd_apply(args) -> int:
 
 def cmd_app_local(args) -> int:
     try:
-        facts, raw = approve(Path(args.vpk), args.case)
+        with approve_file(Path(args.vpk), args.case) as (facts, source):
+            return _app_approved(args, facts, source)
     except Denied as exc:
         print(json.dumps({"status": "DENIED", "reason": str(exc)}))
         return 2
+
+
+def _app_approved(args, facts, source) -> int:
     title = facts["title_id"]
     if title != TESTAPP_ID and not facts["install_only"]:
         print("ERR device-title-not-supported")
@@ -395,15 +404,15 @@ def cmd_app_local(args) -> int:
         return 0
     # Derive the destination only from approved identity; transmit the inspected bytes.
     remote = f"ux0:/VITA-POC/{title}-{facts['sha256'][:8]}-{os.urandom(6).hex()}.vpk"
-    rc, out = ssh(f"put {remote} {len(raw)} sha256={facts['sha256']}",
-                  timeout=args.timeout, stdin_bytes=raw)
+    rc, out = ssh(f"put {remote} {facts['bytes']} sha256={facts['sha256']}",
+                  timeout=args.timeout, stdin_bytes=source)
     print(f"[{time.strftime('%H:%M:%S')}] upload      {out or 'rc=' + str(rc)}")
     # put/app-install each emits exactly one terminal receipt. Mixed or
     # duplicate records are unconfirmed, even if SSH reports exit 0.
-    if rc != 0 or out != f"OK put path={remote} bytes={len(raw)} sha256={facts['sha256']}":
+    if rc != 0 or out != f"OK put path={remote} bytes={facts['bytes']} sha256={facts['sha256']}":
         print("ERR upload-unconfirmed; app-install was not sent")
         return 4
-    rc, out = ssh(f"app-install {remote}", timeout=args.timeout)
+    rc, out = ssh(f"app-install {remote}", timeout=args.timeout, progress_total=facts['bytes'])
     print(f"[{time.strftime('%H:%M:%S')}] app-install {out}")
     receipt = (rf"OK app-install title={re.escape(title)} app_ver={re.escape(facts['app_ver'])}"
                r" files=[1-9][0-9]* detail=(?:0|[1-9][0-9]*) session=kept")
@@ -554,7 +563,7 @@ def cmd_report(args) -> int:
 
 PUT_ROOT = "ux0:/VITA-POC/"
 PHOTO_MAX = 8 * 1024 * 1024
-PUT_MAX = 192 * 1024 * 1024
+PUT_MAX = wb_tree.MAX_BYTES
 PHOTO_NAME = re.compile(r"[a-zA-Z0-9_-]{1,95}\.(?:jpe?g|png)", re.ASCII | re.I)
 PHOTO_IEND = bytes.fromhex("0000000049454e44ae426082")
 
@@ -586,6 +595,8 @@ def _flat_put_path(path: str) -> bool:
 def cmd_put(args) -> int:
     local = Path(args.local)
     image = getattr(args, "image", False)
+    if not image:
+        return _cmd_file_put(args, local)
     limit = PHOTO_MAX if image else PUT_MAX
     try:
         if not local.is_file():
@@ -654,6 +665,25 @@ def cmd_put(args) -> int:
     return 6
 
 
+def _cmd_file_put(args, local) -> int:
+    remote=args.remote if args.remote is not None else PUT_ROOT+local.name
+    if not _flat_put_path(remote):
+        print(f"ERR invalid destination: use one safe filename under {PUT_ROOT}")
+        return 2
+    try:
+        with wb_tree.file_snapshot(local, PUT_MAX) as source:
+            rc,out=ssh(f"put {remote} {source.size} sha256={source.sha256}",
+                       timeout=args.timeout,stdin_bytes=source)
+            print(out or f"rc={rc}")
+            if (rc,out)!=(0,f"OK put path={remote} bytes={source.size} sha256={source.sha256}"):
+                print("ERR upload not confirmed; do not automatically retry")
+                return 4
+            return 0
+    except (OSError,ValueError) as exc:
+        print(f"ERR local-file {exc}")
+        return 2
+
+
 def main(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(prog="wbctl", description="Vita Workbench control (5090)")
     ap.add_argument("--json", action="store_true", help="machine readable output where supported")
@@ -696,7 +726,8 @@ def main(argv: list[str]) -> int:
     p_app_i.add_argument("vpk")
     p_app_i.add_argument("--case", help="also validate a registered test case")
     p_app_i.add_argument("--yes", action="store_true")
-    p_app_i.add_argument("--timeout", type=float, default=240.0)
+    p_app_i.add_argument("--timeout", type=float, default=7200.0,
+                         help="seconds per upload/install operation (default: 7200; large apps need time)")
 
     p_test = sub.add_parser("test", help="run a device case through the approved test app")
     test_sub = p_test.add_subparsers(dest="test_cmd", required=True)

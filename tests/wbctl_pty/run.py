@@ -12,6 +12,7 @@ class Device:
     def __init__(self):
         self.files={};self.cmds=[];self.dialogue=[];self.version='01.63';self.run='1'*16;self.target='';self.launch={};self.corrupt=None
     def push(self,p,path):
+        if isinstance(p,term.wb_tree.FileSource):p=p.path
         self.cmds.append('put');data=p.read_bytes();assert path not in self.files
         self.files[path]=data;return dict(action='put',remote=path,bytes=len(data),sha256=sha(data))
     def pull(self,path,p,max_bytes):
@@ -24,7 +25,10 @@ class Device:
     def _transcript_and_exit(self,wire,timeout=20):
         self.dialogue.append(wire);p=shlex.split(wire);op=p[0];self.cmds.append(op)
         if op=='ver':
-            build=FIXTURE_BUILD if self.version==FIXTURE_VERSION else self.version+'-live-layout'
+            # Health checks still name the installed core. The candidate header can be newer.
+            if self.version==FIXTURE_VERSION:build=FIXTURE_BUILD
+            elif self.version==w.CORE_VERSION:build=w.CORE_BUILD
+            else:build=self.version+'-live-layout'
             out='ERR invalid or disallowed Workbench command/options' if len(p)>1 else f'wb version={self.version} build={build} abi=3 proto=wb10 run={self.run} payload=none uptime_ms=15'
         elif op=='status':out=f'run={self.run} uptime_ms=15 ssh=connected cmds=7 payload=none core={self.version} last_install=none peer=192.0.2.10:2222'
         elif op=='help':out='Workbench commands include ver status df timeline pending inspect plan shot photo-export'

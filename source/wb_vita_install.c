@@ -8,6 +8,7 @@
 #include "wb_ver.h"
 
 #include <psp2/appmgr.h>
+#include <psp2/io/stat.h>
 #include <psp2/kernel/threadmgr.h>
 #include <psp2/promoterutil.h>
 #include <psp2/sysmodule.h>
@@ -94,7 +95,7 @@ int wb_vita_promote_stage(const char *stage, bool skip_period, int *detail) {
     int outcome;
     if (async_rc >= 0) {
         outcome = promote_poll();
-    } else if (!strcmp(stage, WB_UPDATER_STAGE)) {
+    } else if (!strcmp(stage, WB_UPDATER_STAGE) || !strcmp(stage, WB_ROOT "/patch-0213")) {
         /* No retry of our fixed helper: a negative submission isn't proof
          * that no bubble was created. Reinspect on the next owner operation. */
         if (detail) *detail = async_rc;
@@ -112,6 +113,37 @@ int wb_vita_promote_stage(const char *stage, bool skip_period, int *detail) {
 
     if (period >= 0) (void)_sceAppMgrContentInstallPeriodStop();
 
+    (void)scePromoterUtilityExit();
+    (void)sceSysmoduleUnloadModuleInternal(SCE_SYSMODULE_INTERNAL_PROMOTER_UTIL);
+    (void)unload_paf();
+    return outcome;
+}
+
+int wb_vita_delete_pkg(const char *title, int *detail) {
+    if (!title || strlen(title) != 9) return WB_E_ARG;
+    if (!strcmp(title, WB_TITLE_ID) || !strcmp(title, WB_UPDATER_TITLE_ID) || !strncmp(title, "NPXS", 4))
+        return WB_E_PATH;
+    if (detail) *detail = 0;
+    char sys_path[64];
+    snprintf(sys_path, sizeof sys_path, "vs0:/app/%.9s", title);
+    SceIoStat st;
+    memset(&st, 0, sizeof st);
+    if (sceIoGetstat(sys_path, &st) >= 0) return WB_E_PATH;
+
+    int rc = load_paf();
+    if (rc < 0) { if (detail) *detail = rc; return WB_E_PROMOTE; }
+    rc = sceSysmoduleLoadModuleInternal(SCE_SYSMODULE_INTERNAL_PROMOTER_UTIL);
+    if (rc < 0) { if (detail) *detail = rc; (void)unload_paf(); return WB_E_PROMOTE; }
+    rc = scePromoterUtilityInit();
+    if (rc < 0) {
+        if (detail) *detail = rc;
+        (void)sceSysmoduleUnloadModuleInternal(SCE_SYSMODULE_INTERNAL_PROMOTER_UTIL);
+        (void)unload_paf();
+        return WB_E_PROMOTE;
+    }
+    int del_rc = scePromoterUtilityDeletePkg(title);
+    int outcome = del_rc >= 0 ? promote_poll() : WB_E_PROMOTE;
+    if (detail && del_rc < 0) *detail = del_rc;
     (void)scePromoterUtilityExit();
     (void)sceSysmoduleUnloadModuleInternal(SCE_SYSMODULE_INTERNAL_PROMOTER_UTIL);
     (void)unload_paf();

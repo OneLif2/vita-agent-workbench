@@ -45,10 +45,10 @@ def decode_frame(path,cols=80,rows=24):
             g.append(bits)
         try:return m[tuple(g)]
         except KeyError:raise ValueError(f'unknown glyph at ({px},{py}): {g}') from None
-    heading="VITA AGENT TERMINAL / SHARED SSH"
+    heading="VITA AGENT WORKBENCH 2.0"
     if ''.join(glyph(18+12*c,37,2) for c in range(len(heading)))!=heading:raise ValueError('not shared SSH panel')
     # The physical contract is deliberately independent of panel constants.
-    footer="DPAD SCROLL/PAN / SQUARE LIVE / TRIANGLE REVIEW / SELECT REVOKES / START EXITS"
+    footer="DPAD SCROLL/PAN / SQUARE LIVE / START EXITS"
     if ''.join(glyph(18+12*c,523,2) for c in range(len(footer)))!=footer:raise ValueError('missing or overwritten footer')
     scale=2;cw,ch=12,20
     return [''.join(glyph(X+c*cw,Y+r*ch,scale) for c in range(min(cols,960//cw))).rstrip()

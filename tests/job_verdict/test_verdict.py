@@ -6,7 +6,9 @@ from unittest.mock import patch
 R=Path(__file__).resolve().parents[2];sys.path.insert(0,str(R/"tools"))
 import wbctl as w
 sys.path.insert(0,str(R/"tests"))
-from native_identity import VERSION, BUILD
+# This consumer deliberately remains bound to installed 02.10 until deployment.
+# Its fake replies must use its actual checker, not the uninstalled native candidate.
+from check_in_place import VERSION, BUILD
 # The 01.54 signed-off VPK remains the approved TestApp in this release.
 # The tests use the same title/version/hash admission as the real command.
 APP=R/"build/testapp.vpk"
@@ -87,6 +89,15 @@ class Verdict(unittest.TestCase):
         with patch.object(w,"ssh",return_value=(0,ver(A).replace(BUILD,"01.30-live-storage1"))) as sock, tempfile.TemporaryDirectory() as t, patch.object(w,"JOBS_DIR",Path(t)),contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(w.main(["test","run","fs-smoke","--vpk",str(APP)]),7)
             self.assertEqual(sock.call_count,1)
+    def test_uninstalled_candidate_is_not_the_installed_identity(self):
+        from native_identity import VERSION as candidate_version, BUILD as candidate_build
+        self.assertNotEqual((candidate_version,candidate_build),(VERSION,BUILD))
+        reply=ver(A).replace(f"version={VERSION} build={BUILD}",
+                             f"version={candidate_version} build={candidate_build}")
+        with patch.object(w,"ssh",return_value=(0,reply)) as sock, tempfile.TemporaryDirectory() as t, patch.object(w,"JOBS_DIR",Path(t)),contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(w.main(["test","run","fs-smoke","--vpk",str(APP)]),7)
+            self.assertEqual(sock.call_count,1)
+
     def test_requires_new_run(self):
         with tempfile.TemporaryDirectory() as t,patch.object(w,"JOBS_DIR",Path(t)),contextlib.redirect_stdout(io.StringIO()):
             def fake(c,**kw):

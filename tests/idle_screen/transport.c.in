@@ -1,0 +1,58 @@
+#include <assert.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#include "wb_ssh.h"
+#include "wb_shell_channel.h"
+static bool connected=true,closed,eof;
+static unsigned ended,checks;
+static char failure[32];
+#define CHECK(x) do { assert(x); checks++; } while (0)
+static int ssh_channel_is_closed(struct ssh_channel_struct *c){assert(c);return closed;}
+static int ssh_channel_is_eof(struct ssh_channel_struct *c){assert(c);return eof;}
+bool wb_ssh_connected(const wb_ssh *s){return s && s->session && connected;}
+static void fail(wb_ssh *s,const char *why){(void)s;snprintf(failure,sizeof failure,"%s",why);}
+void wb_ssh_end_session(wb_ssh *s){ended++;s->authenticated=false;}
+ACTUAL_INTERACTIVE_KEEP
+static int deadline_check(wb_ssh *s,uint64_t t){
+ACTUAL_DEADLINE_CHECKS
+    return 0;
+}
+static wb_shell_channel shell;
+static wb_ssh pair(void){
+    connected=true;closed=eof=false;ended=0;failure[0]=0;memset(&shell,0,sizeof shell);
+    return (wb_ssh){.authenticated=true,.kex=true,.shell_pty=true,
+        .session=(struct ssh_session_struct *)(uintptr_t)1,
+        .channel=(struct ssh_channel_struct *)(uintptr_t)2,.shell=&shell,
+        .kex_deadline=8000,.auth_deadline=90000,.idle_deadline=1800000,
+        .mode={.mode=MODE_B_KEY,.accepted=true,.pin={1}}};
+}
+int main(void){
+    wb_ssh s=pair();CHECK(!interactive_idle_keep(NULL));
+    CHECK(interactive_idle_keep(&s));
+    CHECK(!deadline_check(&s,900000) && !ended && s.authenticated);
+    CHECK(!deadline_check(&s,1800000) && !ended && s.authenticated);
+    CHECK(!deadline_check(&s,UINT64_C(86400000)) && !ended && s.authenticated);
+    for(int mode=0;mode<12;mode++){
+        s=pair();
+        switch(mode){
+        case 0:s.shell_pty=false;break;case 1:s.shell=NULL;break;
+        case 2:s.mode.mode=MODE_A_PASSWORD;break;case 3:s.mode.mode=MODE_C_INTERACTIVE;break;
+        case 4:s.mode.accepted=false;break;case 5:memset(s.mode.pin,0,sizeof s.mode.pin);break;
+        case 6:s.channel=NULL;break;case 7:shell.closing=true;break;
+        case 8:connected=false;break;case 9:closed=true;break;
+        case 10:eof=true;break;case 11:s.session=NULL;break;
+        }
+        CHECK(!interactive_idle_keep(&s));
+        CHECK(deadline_check(&s,1800000)==1 && ended==1 && !s.authenticated);
+        CHECK(!strcmp(failure,"idle timeout"));
+    }
+    s=pair();s.authenticated=false;
+    CHECK(!interactive_idle_keep(&s));
+    CHECK(deadline_check(&s,90000)==1 && ended==1 && !strcmp(failure,"auth timeout"));
+    s=pair();s.authenticated=false;s.kex=false;
+    CHECK(deadline_check(&s,8000)==1 && ended==1 && !strcmp(failure,"kex timeout"));
+    printf("PASS actual SSH deadline assertions=%u: paired live PTY retained beyond 30 minutes; exec/subsystem, invalid auth, closing, EOF and dead sessions retain timeouts; host stubs\n",checks);
+    return 0;
+}

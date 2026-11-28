@@ -1,12 +1,5 @@
 # Publication scope
 
-Source-only export of reference02.06, with no program development or device changes
-performed for publication. Personal public provisioning and release pipeline files
-are omitted; matching literals elsewhere are replaced with typed local-config slots.
-Precompiled archives, VPK/SUPRX/SELF/ELF files, dumps, private logs, deployment ledgers,
-old transaction baselines and upstream source archives are excluded. The active
-privately configured tree remains untouched.
+Source-only export of reference `02.21` (`02.21-hyper-sftp`) for `OneLif2/psvita-agent-terminal` (renamed from `vita-agent-workbench`). Personal provisioning headers, release pipeline scripts, private host/owner pins, private LAN IP literals, precompiled archives, VPK/SUPRX/SELF/ELF binaries, dumps, and device logs are excluded or replaced with typed local-config slots.
 
-Original code is Apache-2.0 at the owner's direction. Existing third-party notices
-and license scope are retained; no blanket Apache relicensing is asserted. Public
-build portability and a reusable owner-provisioning workflow remain unfinished.
+Original project code is licensed under Apache-2.0. Existing third-party notices and license boundaries (VitaShell GPLv3, JetBrains Mono SIL OFL 1.1, MicroPython MIT) are retained verbatim in `LICENSES/` and `THIRD_PARTY_NOTICES.md`.

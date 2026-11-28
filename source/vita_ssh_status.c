@@ -1,16 +1,19 @@
 #define _POSIX_C_SOURCE 200809L
 #include <psp2/appmgr.h>
 #include <psp2/ctrl.h>
+#include <psp2/io/dirent.h>
 #include <psp2/io/fcntl.h>
 #include <psp2/io/stat.h>
 #include <psp2/kernel/processmgr.h>
 #include <psp2/kernel/rng.h>
+#include <psp2/kernel/sysmem.h>
 #include <psp2/kernel/threadmgr.h>
 #include <psp2/net/net.h>
 #include <psp2/net/netctl.h>
 #include <psp2/power.h>
 #include <psp2/rtc.h>
 #include <psp2/sysmodule.h>
+#include <psp2/touch.h>
 
 #include <inttypes.h>
 #include <stdbool.h>
@@ -30,8 +33,10 @@
 #include "wb_quick_open.h"
 
 #include "wb_cmd.h"
+#include "wb_df_human.h"
 #include "wb_crash_index.h"
 #include "wb_photo_gate.h"
+#include "wb_sftp_frame.h"
 #include "wb_sftp_vita.h"
 #include "wb_vita_photo.h"
 #include "wb_err.h"
@@ -47,10 +52,13 @@
 #include "wb_checked_hash.h"
 #include "wb_timeline.h"
 #include "wb_ssh.h"
+#include "wb_shell_channel.h"
 #include "wb_panel_keys.h"
 #include "wb_font_command.h"
 #include "wb_str.h"
 #include "wb_ver.h"
+#include "wb_transfer_limits.h"
+#include "wb_idle_screen.h"
 #include "wb_vita_install.h"
 #include "wb_vita_io.h"
 #include "wb_updater.h"
@@ -99,6 +107,7 @@ static wb_ssh g_ssh;
 static wb_vita_install g_vin;
 static wb_out *g_say_out;
 static _Alignas(64) uint8_t workspace[128 * 1024];
+static void *net_pool_raw;
 
 static uint64_t now_ms(void) { return sceKernelGetProcessTimeWide() / 1000u; }
 
@@ -402,8 +411,22 @@ static bool net_setup(void) {
         if (sceSysmoduleLoadModule(SCE_SYSMODULE_NET) < 0) return false;
         a.own_net_module = true;
     }
-    SceNetInitParam p = { .memory = workspace, .size = sizeof workspace };
-    if (sceNetInit(&p) < 0) return false;
+    enum { NET_POOL_BYTES = 2 * 1024 * 1024 };
+    void *pool = workspace;
+    size_t pool_sz = sizeof workspace;
+    net_pool_raw = malloc(NET_POOL_BYTES + 64u);
+    if (net_pool_raw) {
+        uintptr_t aligned = ((uintptr_t)net_pool_raw + 63u) & ~(uintptr_t)63u;
+        pool = (void *)aligned;
+        pool_sz = NET_POOL_BYTES;
+    }
+    SceNetInitParam p = { .memory = pool, .size = (int)pool_sz };
+    if (sceNetInit(&p) < 0) {
+        free(net_pool_raw);
+        net_pool_raw = NULL;
+        p = (SceNetInitParam){ .memory = workspace, .size = sizeof workspace };
+        if (sceNetInit(&p) < 0) return false;
+    }
     a.net = true;
     if (sceNetCtlInit() < 0) return false;
     a.ctl = true;
@@ -621,8 +644,42 @@ static int reset_queued_stage(void *ctx) {
 #include "wb_quick_vita.h"
 #include "wb_remote_start_vita.h"
 
-/* Shared verb bodies are also compiled by the native side-effect fixture. */
+static bool clocks_boosted;
+static void wb_boost_clocks(bool fast);
+static int wb_ux0_budget(uint64_t needed,wb_out *out,bool show);
+static void idle_screen_poll(uint64_t mono,bool input,const SceCtrlData *pad);
+static void wb_app_cooperate(void){SceCtrlData pad={0};const bool input=sceCtrlPeekBufferPositive(0,&pad,1)>0;idle_screen_poll(now_ms(),input,&pad);}
+static void wb_app_meter(const char *phase, uint64_t done, uint64_t total);
+#include "wb_app_spool_vita.h"
+#define WB_APP_COOPERATE() wb_app_cooperate()
+#define WB_APP_METER(ph,d,t) wb_app_meter((ph),(d),(t))
+#define WB_APP_BUDGET(n,out) wb_ux0_budget((n),(out),false)
 #include "wb_app_gate_impl.h"
+#include "wb_patch_auth.h"
+/* A patch signature authorizes only this compiled member recipe, not a
+ * reusable catalog row. Refuse any conflicting installed-policy row. */
+static bool patch_owner_context(void){
+    if(!wb_standing_owner_pty() || !wb_ssh_connected(&g_ssh) ||
+       !wb_standing_provisioned(a.pin,a.user_pin) || !wb_reg_has_title(WB_PATCH_TITLE))return false;
+    const wb_reg_entry *fixed=wb_reg_entry_for(WB_PATCH_TITLE,WB_PATCH_VERSION);
+    return (!fixed||(!fixed->cases[0] && !strcmp(fixed->sha256,WB_PATCH_VPK_SHA))) &&
+           wb_app_local_match(WB_PATCH_TITLE,WB_PATCH_VERSION,WB_PATCH_VPK_SHA)!=0;
+}
+static bool patch_spent;
+static bool patch_ready(void){
+    SceIoStat st={0};
+    if(patch_spent||!patch_owner_context()||
+       (uint32_t)sceIoGetstat(WB_PENDING_PATH,&st)!=UINT32_C(0x80010002))return false;
+    const FocusEvidence e=read_focus();
+    return e.app_rc==0 && !e.state.isSystemUiOverlaid &&
+           scePowerIsSuspendRequired()==0 && scePowerIsLowBattery()==0;
+}
+static bool patch_commit_once(void){
+    if(!patch_ready())return false;
+    patch_spent=true;return true;
+}
+#define WB_PATCH_READY_OK() patch_ready()
+#define WB_PATCH_COMMIT_OK() patch_commit_once()
 #include "wb_reopen_vita.h"
 
 /* v1.40: file-based return intent. The arm-intent job id may only use
@@ -952,7 +1009,7 @@ static int wb_ux0_budget(uint64_t needed, wb_out *out, bool show) {
 static int do_put(const wb_cmd *c, wb_out *out, wb_upload *up) {
     const char *requested = c->argv[0];
     uint64_t want = 0;
-    if (!wb_parse_u64(c->argv[1], &want) || want == 0 || want > WB_UPLOAD_MAX) {
+    if (!wb_parse_u64(c->argv[1], &want) || want == 0 || want > WB_TRANSFER_MAX) {
         (void)wb_out_printf(out, "ERR bad-size\n");
         return WB_E_ARG;
     }
@@ -1056,9 +1113,18 @@ static int do_get(const char *path, wb_out *out) {
 }
 
 #ifdef WB_TTY_FILE
+static void wb_verify_pulse(uint64_t done, uint64_t total);
+#define WB_VERIFY_PULSE(d,t) wb_verify_pulse((d),(t))
 #include "wb_tty_file.h"
 #include "wb_tty_vita.inc"
 #endif
+#include "wb_app_patch_vita.inc"
+#undef WB_PATCH_COMMIT_OK
+#undef WB_PATCH_READY_OK
+static void wb_op_progress(const char *tag, uint64_t done, uint64_t total);
+#define WB_OP_PROGRESS(tag,done,total) wb_op_progress((tag),(done),(total))
+#include "wb_linux_cmds.h"
+#include "wb_agent_apps.h"
 
 static int do_reload(wb_out *out) {
     char ver[32] = {0};
@@ -1179,33 +1245,25 @@ static int core_exec(void *ctx, const wb_cmd *cmd, wb_out *out, wb_upload *up, i
     *status = 0;
     switch (cmd->kind) {
         case WB_CMD_TERM_WB_STATUS: return wb_status_snapshot(cmd,out,status);
-        case WB_CMD_TERM_R1_SIGNED: return wb_standing_issue(cmd,out,status);
-        case WB_CMD_TERM_R1_AUTO_STATUS: return wb_standing_status(cmd,out,status);
+        case WB_CMD_TERM_R1_SIGNED:
+        case WB_CMD_TERM_R1_AUTO_STATUS:
+        case WB_CMD_TERM_R1_NOTICE:
+        case WB_CMD_APPLY_RETURN:
+            *status=1;
+            return wb_out_puts(out,"ERR r1-removed: Workbench 2.0 uses zero-button update stage + update apply\n");
         case WB_CMD_TERM_CLOSE_WB:
             *status=1;
             if(!g_ssh.authenticated || !g_ssh.mode.accepted || g_ssh.mode.mode!=MODE_B_KEY ||
                !g_ssh.session || !g_ssh.channel || !g_ssh.shell || !g_ssh.shell_pty || g_ssh.sftp_ro)
                 return wb_out_puts(out,"ERR close-wb no-pty\n");
             if(cmd->argc!=0)return wb_out_puts(out,"ERR close-wb usage: close wb\n");
-            /* No enrolled device-authenticated wake observer or local close
-             * grant is available. Never consume/update R1 or exit here. */
             return wb_out_puts(out,"ERR close-wb wake-not-ready\n");
         case WB_CMD_TERM_R1_REVIEW:
-            return wb_review_describe(g_ssh.authenticated && g_ssh.mode.accepted && g_ssh.mode.mode==MODE_B_KEY &&
-                                      g_ssh.session && g_ssh.channel && g_ssh.shell && g_ssh.shell_pty && !g_ssh.sftp_ro,
-                                      cmd->argc,a.run_hex,r1_queue,out,status);
+            *status=1;
+            return wb_out_puts(out,"ERR r1-removed: Workbench 2.0 uses zero-button update stage + update apply\n");
         case WB_CMD_TERM_CRASH_INDEX:
             return wb_crash_index(cmd,g_ssh.authenticated && g_ssh.mode.accepted && g_ssh.mode.mode==MODE_B_KEY &&
                                   g_ssh.session && g_ssh.channel && g_ssh.shell && g_ssh.shell_pty && !g_ssh.sftp_ro,out,status);
-        case WB_CMD_TERM_R1_NOTICE: {
-            const bool pty=g_ssh.authenticated && g_ssh.mode.accepted && g_ssh.mode.mode==MODE_B_KEY &&
-                           g_ssh.session && g_ssh.channel && g_ssh.shell && g_ssh.shell_pty && !g_ssh.sftp_ro;
-            int rc=wb_notice_request(&r1_notice,pty,pty && !r1_source_live && !r1_bound &&
-                  !r1_notice.receipt[0] && foreground(false),cmd->argc,cmd->argv[0],a.run_hex,
-                  now_ms(),a.power_calls,r1_queue,out,status);
-            if(!*status)ui_refresh(NULL,"UPDATE RECEIVED / LOCAL APPROVAL");
-            return rc;
-        }
         case WB_CMD_TERM_USER_STATUS:
         case WB_CMD_TERM_USER_PLAN:
         case WB_CMD_TERM_USER_REMOVE:{
@@ -1235,6 +1293,26 @@ static int core_exec(void *ctx, const wb_cmd *cmd, wb_out *out, wb_upload *up, i
         }
         case WB_CMD_VER:
             return cmd_ver(out);
+        case WB_CMD_TERM_DF_HUMAN: {
+            uint64_t total=0,avail=0;
+            int api=sceAppMgrGetDevInfo("ux0:",&total,&avail);
+            int rc=wb_df_human(out,api,total,avail);*status=rc<0?1:0;
+            return rc;
+        }
+        case WB_CMD_TERM_LINUX: {
+            const bool boost=!strcmp(cmd->name,"sha256sum")||!strcmp(cmd->name,"cp")||!strcmp(cmd->name,"unzip");
+            if(boost)wb_boost_clocks(true);
+            int rc=wb_linux_command(cmd,a.ip,out,status);
+            if(boost)wb_boost_clocks(false);
+            return rc;
+        }
+        case WB_CMD_TERM_AGENT_APP: {
+            const bool boost=!strcmp(cmd->name,"patch-eboot")||!strcmp(cmd->name,"install-vpk");
+            if(boost)wb_boost_clocks(true);
+            int rc=wb_agent_app_command(cmd,out,status);
+            if(boost)wb_boost_clocks(false);
+            return rc;
+        }
         case WB_CMD_DF: {
             uint64_t needed=0;
             if (cmd->argc && !wb_parse_u64(cmd->argv[0],&needed)) {
@@ -1314,6 +1392,22 @@ static int core_exec(void *ctx, const wb_cmd *cmd, wb_out *out, wb_upload *up, i
             }
             return WB_OK;
         }
+        case WB_CMD_TERM_APP_PATCH: {
+            const bool apply=cmd->argc==3;
+            char msg[WB_PATCH_MESSAGE_CAP];
+            if(!(apply||cmd->argc==1)||!patch_owner_context()||
+               !wb_patch_message(msg,a.run_hex,cmd->argv[0])){
+                *status=1;return wb_out_puts(out,"ERR app-patch owner/path/policy\n");
+            }
+            if(apply&&(!wb_owner_verify_message(msg,cmd->argv[1],cmd->argv[2])||!patch_ready())){
+                *status=1;return wb_out_puts(out,"ERR app-patch signature-or-state\n");
+            }
+            wb_boost_clocks(true);
+            int rc=wb_app_patch_execute(cmd->argv[0],apply,out);
+            wb_boost_clocks(false);
+            if(rc!=WB_OK)*status=1;
+            return rc;
+        }
         case WB_CMD_TERM_APP_APPROVE: {
             /* One exact artifact, authorized by the enrolled release key. The
              * package is read from disk and hashed in place; the operator
@@ -1323,19 +1417,28 @@ static int core_exec(void *ctx, const wb_cmd *cmd, wb_out *out, wb_upload *up, i
             wb_vfile file={0};wb_reader rd={0};wb_zip zip={0};
             int rc=wb_vita_reader_open(cmd->argv[0],&rd,&file);
             if(rc!=WB_OK){*status=1;return wb_out_printf(out,"ERR app-approve open rc=%s\n",wb_err_name(rc));}
+            wb_boost_clocks(true);
+            size_t cap=262144u;
+            uint8_t *chunk=(uint8_t *)malloc(cap);
+            if(!chunk){cap=16384u;chunk=(uint8_t *)malloc(cap);}
             wb_sha256 sh;wb_sha256_init(&sh);
-            uint8_t chunk[4096];uint64_t off=0;bool hashed=true;
-            while(off<rd.size){
-                size_t take=rd.size-off>sizeof chunk?sizeof chunk:(size_t)(rd.size-off);
+            uint64_t off=0;bool hashed=chunk!=NULL;
+            if(hashed)wb_op_progress("APPROVE",0,rd.size);
+            while(hashed && off<rd.size){
+                size_t take=rd.size-off>cap?cap:(size_t)(rd.size-off);
                 if(rd.read_at(rd.ctx,off,chunk,take)!=WB_OK){hashed=false;break;}
                 wb_sha256_update(&sh,chunk,take);off+=take;
+                wb_app_cooperate();
+                wb_op_progress("APPROVE",off,rd.size);
             }
+            free(chunk);
             char shahex[65]={0},title[16]={0},ver[16]={0};
             if(hashed){uint8_t digest[32];wb_sha256_final(&sh,digest);wb_sha_hex(digest,32,shahex);}
             if(hashed)rc=wb_zip_open(&zip,&rd);
             if(rc==WB_OK)rc=wb_app_parse_sfo(&zip,title,ver);
             const uint64_t bytes=rd.size;
             wb_vita_reader_close(&file);
+            wb_boost_clocks(false);
             if(!hashed||rc!=WB_OK){*status=1;return wb_out_puts(out,"ERR app-approve package\n");}
             if(!wb_app_local_approve(title,ver,(unsigned long long)bytes,shahex,cmd->argv[1],cmd->argv[2])){
                 *status=1;
@@ -1346,7 +1449,9 @@ static int core_exec(void *ctx, const wb_cmd *cmd, wb_out *out, wb_upload *up, i
         }
         case WB_CMD_TERM_APP_PLAN: {
             if(cmd->argc<1 || cmd->argc>2){*status=1;return wb_out_puts(out,"ERR app-plan operands\n");}
+            wb_boost_clocks(true);
             int rc=wb_app_operation(cmd->argv[0],cmd->argc==2?cmd->argv[1]:NULL,true,out);
+            wb_boost_clocks(false);
             if(rc!=WB_OK)*status=1;
             return rc;
         }
@@ -1356,7 +1461,9 @@ static int core_exec(void *ctx, const wb_cmd *cmd, wb_out *out, wb_upload *up, i
             return rc;
         }
         case WB_CMD_APP_INSTALL: {
+            wb_boost_clocks(true);
             const int rc = do_app_install(cmd->argv[0], out);
+            wb_boost_clocks(false);
             if (rc != WB_OK) *status = 1;
             return rc;
         }
@@ -1395,14 +1502,14 @@ static int core_exec(void *ctx, const wb_cmd *cmd, wb_out *out, wb_upload *up, i
             return wb_out_printf(out,"OK updater-check title=%s %s\n",
                                  WB_UPDATER_TITLE_ID,wb_updater_decision());
         }
-        case WB_CMD_R1_STATUS: return r1_status(out);
-        case WB_CMD_APPLY_RETURN:
+        case WB_CMD_R1_STATUS:
+            return wb_out_puts(out,"r1 state=removed mode=agent-ops\n");
         case WB_CMD_PROMOTE: /* No direct native promote of the public stage. */
         case WB_CMD_S1_CHECK:
         case WB_CMD_APPLY_CORE: {
             const bool selfcheck=cmd->kind==WB_CMD_S1_CHECK;
-            const bool unattended=cmd->kind==WB_CMD_APPLY_RETURN;
-            const bool signed_transaction=unattended && r1_signed_armed;
+            const bool unattended=false;
+            const bool signed_transaction=false;
             wb_signed_focus transaction_focus={0},handoff_focus={0};
             char handoff_receipt[WBQ_CAP]={0};
             /* A signed update is one bounded transaction, including savedata,
@@ -1701,6 +1808,221 @@ static int inactive_screen(const char *label) {
 }
 
 
+static void wb_boost_clocks(bool fast) {
+    if (fast == clocks_boosted) return;
+    clocks_boosted = fast;
+    (void)scePowerSetArmClockFrequency(fast ? 444 : 333);
+    (void)scePowerSetBusClockFrequency(fast ? 222 : 166);
+}
+static uint64_t sftp_present_ms, sftp_t0, sftp_b0;
+static uint32_t sftp_ser;
+static wb_xfer_ui sftp_meter;
+static int wb_sftp_pace(bool display_off, const char **reason, unsigned *ui_seen) {
+    if (!g_ssh.sftp_ro) {
+        sftp_ser = 0;
+        sftp_meter.text[0] = 0;
+        return 0;
+    }
+    wb_boost_clocks(true);
+    bool progressed = false;
+    const uint64_t burst_end = now_ms() + 120;
+    while (g_ssh.sftp_ro && now_ms() < burst_end) {
+        const size_t got = g_ssh.sftp_ro->got, pend = g_ssh.sftp_ro->pending, sent = g_ssh.sftp_ro->sent;
+        const uint32_t ser = g_ssh.sftp_ro->engine.last_serial;
+        uint64_t off_sum = 0;
+        for (unsigned h = 0; h < WB_SFTP_HANDLES; h++) off_sum += g_ssh.sftp_ro->engine.handles[h].offset;
+        if (!wb_ssh_service(&g_ssh, (wb_core *)&g_core)) {
+            *reason = "SSH ERROR";
+            return -1;
+        }
+        if (!g_ssh.sftp_ro) break;
+        uint64_t off_after = 0;
+        for (unsigned h = 0; h < WB_SFTP_HANDLES; h++) off_after += g_ssh.sftp_ro->engine.handles[h].offset;
+        if (g_ssh.sftp_ro->got == got && g_ssh.sftp_ro->pending == pend &&
+            g_ssh.sftp_ro->sent == sent && g_ssh.sftp_ro->engine.last_serial == ser &&
+            off_after == off_sum) break;
+        progressed = true;
+    }
+    if (!g_ssh.sftp_ro) {
+        sftp_ser = 0;
+        sftp_meter.text[0] = 0;
+        return 0;
+    }
+    const uint64_t now = now_ms();
+    bool active_file = false, is_put = false;
+    uint32_t active_ser = 0;
+    uint64_t active_bytes = 0, active_total = 0;
+    for (unsigned h = 0; h < WB_SFTP_HANDLES; h++) {
+        const wb_sftp_handle *hd = &g_ssh.sftp_ro->engine.handles[h];
+        if (!hd->used || hd->dir) continue;
+        active_file = true;
+        is_put = hd->writer != NULL;
+        active_ser = hd->serial;
+        active_bytes = hd->offset;
+        active_total = hd->total;
+        break;
+    }
+    bool force_draw = false;
+    if (active_file) {
+        if (active_ser != sftp_ser) {
+            sftp_ser = active_ser;
+            sftp_t0 = now;
+            sftp_b0 = active_bytes;
+            force_draw = true;
+        }
+        const uint64_t dt = now > sftp_t0 ? now - sftp_t0 : 1;
+        const uint64_t moved = active_bytes >= sftp_b0 ? active_bytes - sftp_b0 : 0;
+        const uint64_t bps = moved * 1000u / dt;
+        const char *tag = is_put ? "SFTP PUT" : "SFTP GET";
+        if (active_total > 0) {
+            wb_xfer_format_pct(&sftp_meter, tag, active_bytes, active_total, bps);
+            if (active_bytes >= active_total) force_draw = true;
+        } else {
+            wb_xfer_format_stream(&sftp_meter, tag, active_bytes, bps);
+        }
+    } else {
+        if (sftp_ser) force_draw = true;
+        sftp_ser = 0;
+        sftp_meter.text[0] = 0;
+    }
+    if (!display_off && (force_draw || !sftp_present_ms || now < sftp_present_ms || now - sftp_present_ms >= 250)) {
+        sftp_present_ms = now;
+        phase_begin("PHASE DISPLAY PRESENT");
+        const bool agent_online = g_ssh.authenticated && wb_ssh_connected(&g_ssh);
+        const bool drew = display_terminal_transfer(a.pin, a.ui_line2, agent_online,
+            sftp_meter.text[0] ? &sftp_meter : NULL, now);
+        phase_end(drew ? 0 : -1);
+        if (!drew) {
+            *reason = "DISPLAY ERROR";
+            return -1;
+        }
+        const unsigned ui_bit = agent_online ? 2u : 1u;
+        if (!(*ui_seen & ui_bit)) {
+            *ui_seen |= ui_bit;
+            (void)log_event(agent_online ? "UI PRESENT TERMINAL ONLINE" : "UI PRESENT TERMINAL IDLE");
+        }
+    }
+    sceKernelDelayThread(progressed ? 0 : 1000);
+    return 1;
+}
+
+/* Display idleness is independent of SSH/auth deadlines and focus admission. */
+static wb_idle_screen idle_screen;
+static bool idle_screen_activity(bool input,const SceCtrlData *pad) {
+    if(input && (pad->buttons || pad->lx<48 || pad->lx>208 || pad->ly<48 || pad->ly>208 ||
+                 pad->rx<48 || pad->rx>208 || pad->ry<48 || pad->ry>208))return true;
+    SceTouchData touch={0};
+    if(sceTouchPeek(SCE_TOUCH_PORT_FRONT,&touch,1)>0 && touch.reportNum)return true;
+    memset(&touch,0,sizeof touch);
+    return sceTouchPeek(SCE_TOUCH_PORT_BACK,&touch,1)>0 && touch.reportNum;
+}
+static void idle_screen_poll(uint64_t mono,bool input,const SceCtrlData *pad) {
+    /* Keep strict-mode policy unchanged; normal paired operation is resilient. */
+    if(a.resilient)(void)sceKernelPowerTick(SCE_KERNEL_POWER_TICK_DISABLE_AUTO_SUSPEND);
+    const int action=wb_idle_screen_step(&idle_screen,mono,idle_screen_activity(input,pad),a.resilient);
+    if(action){
+        const int rc=action==WB_IDLE_OFF?scePowerRequestDisplayOff():scePowerRequestDisplayOn();
+        wb_idle_screen_result(&idle_screen,mono,action,rc);
+        char note[144];
+        snprintf(note,sizeof note,"IDLE DISPLAY %s rc=0x%08X idle_ms=%llu ssh_policy=retain",
+                 action==WB_IDLE_OFF?"OFF":"ON",(unsigned)rc,
+                 (unsigned long long)(mono-idle_screen.last_activity_ms));
+        (void)log_event(note);
+    }
+    if(!idle_screen.off)(void)sceKernelPowerTick(SCE_KERNEL_POWER_TICK_DISABLE_OLED_OFF);
+}
+
+#ifdef WB_TTY_FILE
+/* The listener otherwise services one TTY frame and then sleeps 16 ms.
+ * A 2048-byte stop-and-wait chunk is then capped near 128 KB/s. While a
+ * transfer is open, drain frames that are already buffered and poll again
+ * in under a millisecond. The paired shell, path checks and SHA receipt
+ * stay the same. */
+static uint64_t xfer_t0, xfer_b0, xfer_note_ms, xfer_present_ms;
+static bool xfer_tracking, xfer_status_override;
+static char xfer_saved[64];
+static wb_xfer_ui xfer_meter;
+static void xfer_restore(void) {
+    /* The local overlay never owns ui_line2: no stale text is restored. */
+    xfer_tracking=false;
+    xfer_status_override=false;
+    xfer_meter.text[0]=0;
+}
+static void xfer_note(const wb_tty_file *f) {
+    const uint64_t now=now_ms();
+    if(!xfer_tracking){
+        wb_strcpy(xfer_saved,sizeof xfer_saved,a.ui_line2);
+        xfer_tracking=true;
+        xfer_status_override=false;
+        xfer_t0=now;
+        xfer_b0=f->offset;
+        xfer_note_ms=0;
+    }else if(strcmp(a.ui_line2,xfer_saved)){
+        /* Keep newer owner/security messages intact until the file closes. */
+        xfer_status_override=true;
+    }
+    if(xfer_status_override)return;
+    if(xfer_meter.text[0] && now>=xfer_note_ms && now-xfer_note_ms<200)return;
+    xfer_note_ms=now;
+    const uint64_t dt=now>xfer_t0?now-xfer_t0:1;
+    const uint64_t moved=f->offset>=xfer_b0?f->offset-xfer_b0:0;
+    /* TTY file sizes and offsets are bounded by the uint32 device guard. */
+    wb_xfer_format(&xfer_meter,f->put,(uint32_t)f->offset,(uint32_t)f->size,moved*1000/dt);
+}
+/* 1 = this tick already paced the transfer; 0 = idle path; -1 = stop the listener. */
+static int wb_transfer_pace(const char **reason, unsigned *ui_seen) {
+    if (!g_ssh.shell || !g_ssh.shell->file) {
+        xfer_restore();
+        return 0;
+    }
+    bool progressed = false;
+    const uint64_t burst_end = now_ms() + 30;
+    while (g_ssh.shell && g_ssh.shell->file && now_ms() < burst_end) {
+        const uint64_t off = g_ssh.shell->file->offset;
+        /* Buffered or partially parsed input is real scheduling progress, not
+         * a disk ACK. Keep the meter on offset; keep the bounded burst busy. */
+        const size_t staged = g_ssh.shell->file->buffered;
+        const size_t partial = g_ssh.shell->file->n;
+        const size_t queued = g_ssh.shell->queued;
+        const size_t sent = g_ssh.shell->sent;
+        if (!wb_ssh_service(&g_ssh, (wb_core *)&g_core)) {
+            *reason = "SSH ERROR";
+            return -1;
+        }
+        if (!g_ssh.shell || !g_ssh.shell->file) break;
+        if (g_ssh.shell->file->offset == off && g_ssh.shell->file->buffered == staged &&
+            g_ssh.shell->file->n == partial && g_ssh.shell->queued == queued &&
+            g_ssh.shell->sent == sent) break;
+        progressed = true;
+    }
+    if (!g_ssh.shell || !g_ssh.shell->file) {
+        xfer_restore();
+        return 0;
+    }
+    xfer_note(g_ssh.shell->file);
+    const uint64_t now = now_ms();
+    if (!idle_screen.off && (!xfer_present_ms || now < xfer_present_ms || now - xfer_present_ms >= 50)) {
+        xfer_present_ms = now;
+        phase_begin("PHASE DISPLAY PRESENT");
+        const bool agent_online = g_ssh.authenticated && wb_ssh_connected(&g_ssh);
+        const bool drew = display_terminal_transfer(a.pin, a.ui_line2, agent_online,
+            xfer_status_override ? NULL : &xfer_meter, now);
+        phase_end(drew ? 0 : -1);
+        if (!drew) {
+            *reason = "DISPLAY ERROR";
+            return -1;
+        }
+        const unsigned ui_bit = agent_online ? 2u : 1u;
+        if (!(*ui_seen & ui_bit)) {
+            *ui_seen |= ui_bit;
+            (void)log_event(agent_online ? "UI PRESENT TERMINAL ONLINE" : "UI PRESENT TERMINAL IDLE");
+        }
+    }
+    sceKernelDelayThread(progressed ? 200 : 1000);
+    return 1;
+}
+#endif
+
 int main(void) {
     startup_mark("MAIN ENTER", 0);
     if (!display_init()) { display_plain_error("DISPLAY INIT STOPPED"); return 1; }
@@ -1745,56 +2067,21 @@ int main(void) {
     }
     reason = "STARTUP STOPPED";
 
+    /* Workbench 2.0 Agent-Operated Startup: when paired host identity is already
+     * enrolled, auto-enter SSH LISTENING with zero physical Vita button prompts
+     * and never display the SSH host key screen on the Vita. */
     wb_quick_route qr=quick_route();
     bool quick_ok=false;
-    wb_r1_ticket ret={0};bool return_ok=r1_boot(&ret);
+    wb_r1_ticket ret={0};bool return_ok=false;
     bool owner_confirmed = false;
     char arm_job[64]={0};
     const bool consumed = wb_arm_consume(arm_job);
     const bool return_intent = return_intent_take();
-    /* A return marker may reuse a verified, complete identity, never create
-     * one. wb_ssh_prepare separately enforces this at its point of use. */
-    if(return_ok){
-        /* r1_boot already checked the actually enrolled key. Do not enroll. */
-        (void)log_event("R1 RETURN PROOF ACCEPTED");
-        /* The host may chain a further update: this run cannot grant one, but a
-         * fresh process starts unbound. Only the host marker authorises the
-         * restart, and it is removed before the call so it can never loop. */
-#if defined(WB_REOPEN_MARKER)
-        /* Compiled only where the reopen header is present; partial-core host
-         * fixtures slice this function without it. verify_package.py asserts
-         * the strings below really are in the shipped eboot. */
-        if(wb_reopen_requested()){
-            const int rm=(int)r1_remove(WB_REOPEN_MARKER);
-            if(rm==WB_OK && wb_reopen_self()){
-                (void)log_event("R1 REOPEN SELF FOR CLEAN RUN");
-                return 0;   /* LoadExec returned without replacing us: stop here. */
-            }
-            (void)log_event("R1 REOPEN DECLINED");
-        }
-#endif
-    }else if (return_intent && wb_ssh_host_identity_enrolled()) {
-        (void)log_event("RETURN INTENT BRANCH");
-        startup_mark("RETURN INTENT", 1);
-    }else if (consumed && wb_ssh_host_identity_enrolled()) {
-        char note[120];
-        snprintf(note,sizeof note,"RETURN ARM OK job=%s",arm_job);
-        (void)log_event(note);
-        startup_mark("AUTOARM MARKER", 1);
-    } else if(remote_start || qr!=WB_Q_NONE){
-        /* An existing owner+host pair may open its listener even when a
-         * pending queue or an unclassified launch requires recovery. This
-         * grants no update/return authority: r1_boot, signatures and WBQ2
-         * remain separate, and foreground/power/veto/pin checks below stay.
-         * Never turn this route into permission to create an identity. */
-        if(remote_start?remote_start_veto():quick_veto()){reason="QUICK OPEN VETO";goto out;}
-        (void)log_event("PAIRED LISTENER AUTO ENTRY; UPDATE GRANT UNCHANGED");
+    const bool enrolled = wb_ssh_host_identity_enrolled();
+    if(enrolled){
+        (void)log_event(return_intent ? "AGENT RETURN AUTO-START" : "AGENT PAIRED AUTO-START");
         quick_ok=true;
-    }else {
-        if (await_choice("CHECK MAC PUBLIC PIN", a.user_pin, SCE_CTRL_CROSS, 90000) != 1) {
-            reason = "MAC PUBLIC PIN NOT CONFIRMED";
-            goto out;
-        }
+    }else{
         owner_confirmed = true;
     }
 
@@ -1802,17 +2089,12 @@ int main(void) {
         reason = g_ssh.error[0] ? g_ssh.error : "SSH IDENTITY FAILED";
         goto out;
     }
-    if(return_ok && !wb_r1_pin_equal(ret.host_pin,g_ssh.host_pin)){reason="R1 HOST CHANGED";goto out;}
-    if(quick_ok && !wb_quick_pair(a.user_pin,g_ssh.host_pin)){reason="QUICK HOST CHANGED";goto out;}
     wb_strcpy(a.pin, sizeof a.pin, g_ssh.host_pin);
     startup_mark("HOST IDENTITY READY", 0);
     if(remote_start){
-        if(!quick_enabled() || !wb_quick_pair(a.user_pin,g_ssh.host_pin) || remote_start_veto()){
-            reason="REMOTE PAIR OR VETO";goto out;
-        }
         a.remote_start=true;
-        a.resilient=true; /* owner policy; the strict-mode file is not rewritten */
-        if(!log_event("REMOTE OWNER START ENABLED; NO UPDATE GRANT")){reason="REMOTE AUDIT FAILED";goto out;}
+        a.resilient=true;
+        (void)log_event("REMOTE OWNER START ENABLED");
     }else{
         reason = wait_initial_focus();
         if (reason) goto out;
@@ -1822,93 +2104,21 @@ int main(void) {
     if (a.power_cb < 0 || scePowerRegisterCallback(a.power_cb) < 0) { reason = "POWER WATCH FAILED"; goto out; }
     a.power_registered = true;
     const bool update_return = consumed || return_ok || return_intent;
-    const bool hands_free=return_ok || update_return || quick_ok;
-    if(return_ok)memcpy(pw_diag_source,ret.source_run,sizeof pw_diag_source); /* public correlation only, never read by a gate */
-    if(remote_start){
-        /* Telemetry is sampled, not changed or misrepresented as foreground.
-         * Registration flags are not an approval prerequisite for this
-         * already-paired owner's listener. R1 update guards stay separate. */
-        if(remote_start_veto()){reason="REMOTE LOCAL VETO";goto out;}
-        if(!remote_start_observe("power")){reason="REMOTE AUDIT FAILED";goto out;}
-    }else{
-        reason = initial_power_drain(registration,hands_free,quick_ok,return_ok,update_return || quick_ok);
-        if (reason) goto out;
-        if (!foreground(false)) { reason = "FOCUS LOST AFTER POWER WATCH"; goto out; }
-    }
-
-    if(return_ok){
-        SceCtrlData veto={0};
-        if(!wb_r1_valid(&ret,r1_now()) || (remote_start?remote_start_veto():
-           (sceCtrlPeekBufferPositive(0,&veto,1)<=0 || (veto.buttons & (SCE_CTRL_START|SCE_CTRL_SELECT))))){reason="R1 VETO OR EXPIRED";goto out;}
-    }else if(update_return){
-        /* A verified return (arm intent / return-intent file) must not fall
-         * through to the 01.09 "CROSS ENABLES LIVE UPDATE" consent gate: the
-         * owner already authorized this exact staged build before the updater
-         * ran. START/SELECT still veto, exactly like the R1 path. */
-        SceCtrlData veto={0};
-        if(remote_start?remote_start_veto():(sceCtrlPeekBufferPositive(0,&veto,1)<=0 ||
-           (veto.buttons & (SCE_CTRL_START|SCE_CTRL_SELECT)))){reason="RETURN VETO";goto out;}
-        (void)log_event("RETURN SKIP CONSENT");
-    }else if(quick_ok){
-        if(remote_start?remote_start_veto():quick_veto()){reason="QUICK OPEN VETO";goto out;}
-    }else{
-        reason = prep_listener();
+    const bool hands_free = true;
+    (void)ret; (void)qr; (void)quick_ok; (void)update_return;
+    if(!remote_start){
+        reason = initial_power_drain(registration,hands_free,true,false,true);
         if (reason) goto out;
     }
-    if (!remote_start && !foreground(false)) { reason = "FOCUS LOST BEFORE NETWORK"; goto out; }
     if (!net_setup()) { reason = "LAN ADDRESS NOT READY"; goto out; }
-    if (!remote_start && !foreground(false)) { reason = "FOCUS LOST BEFORE BIND"; goto out; }
 
-    /* The payload is loaded on demand (reload / ext), not at arm time: a bad
-     * module then costs one command instead of the whole startup path, and
-     * startup.log records whether the loader was entered at all. */
     (void)log_event("PAYLOAD DEFERRED");
-
-    if(return_ok){
-        SceCtrlData veto={0};
-        if(!wb_r1_valid(&ret,r1_now()) || (remote_start?remote_start_veto():
-           (sceCtrlPeekBufferPositive(0,&veto,1)<=0 || (veto.buttons & (SCE_CTRL_START|SCE_CTRL_SELECT))))){reason="R1 VETO OR EXPIRED";goto out;}
-    }
-    if(quick_ok){
-        /* v1.56: the old guard also demanded quick_pref()==Q_REMEMBER, but
-         * apply-core deliberately fences the preference (Q_FENCE) before every
-         * update while wb_quick_decide() already grants WB_Q_REMEMBERED for a
-         * clean bubble launch. The two disagreed, so the first cold start after
-         * each update died with QUICK BIND REFUSED. Decide once, log the parts. */
-        const bool veto=remote_start?remote_start_veto():quick_veto();
-        const bool pair=wb_quick_pair(a.user_pin,g_ssh.host_pin);
-        const bool enabled=quick_enabled();
-        if(veto || !pair || !enabled){
-            char note[128];
-            snprintf(note,sizeof note,"QUICK BIND REFUSED veto=%d pair=%d en=%d pref=%d qr=%d",
-                     veto?1:0,pair?1:0,enabled?1:0,quick_pref(),(int)qr);
-            (void)log_event(note);
-            (void)timeline_event("quick-refused",note,a.run_hex);
-            reason="QUICK BIND REFUSED";goto out;
-        }
-    }
-    /* Every recovery route, including return-intent without quick_ok, must
-     * recheck the exact pair, opt-out and any observed local veto at bind. */
-    if(remote_start && (!quick_enabled() || !wb_quick_pair(a.user_pin,g_ssh.host_pin) || remote_start_veto())){
-        reason="REMOTE PAIR OR VETO BEFORE BIND";goto out;
-    }
     if (wb_ssh_open(&g_ssh, a.ip, WB_PORT, (const char (*)[16])a.peer, a.peer_count) != WB_OK) {
         reason = "LISTEN FAILED";
         goto out;
     }
     if(remote_start)remote_start_installed_audit();
-    if(return_ok){
-        char line[160];snprintf(line,sizeof line,"R1 RETURN LISTENING source=%s nonce=%s",ret.source_run,ret.nonce);
-        if(!log_event(line)){reason="R1 AUDIT FAILED";goto out;}
-        r1_completed=ret;r1_bound=true;
-        wb_standing_bootstrap(&ret);
-    }
-    if(quick_ok && !log_event(qr==WB_Q_DIRECT?"QUICK OPEN LISTENING origin=livearea buttons=0":
-                             qr==WB_Q_REMEMBERED?"QUICK OPEN LISTENING origin=remembered-empty buttons=0":"QUICK OPEN LISTENING origin=paired-recovery buttons=0")){
-        reason="QUICK AUDIT FAILED";goto out;
-    }
-    if(remote_start && !log_event("REMOTE OWNER LISTENING; BACKGROUND ALLOWED")){reason="REMOTE AUDIT FAILED";goto out;}
-    ui_refresh(NULL,remote_start?"REMOTE OWNER MODE / SELECT REVOKES":"TRIANGLE REVIEW UPDATE / SELECT REVOKES");
+    ui_refresh(NULL,"AGENT MODE READY");
     (void)log_event("LISTENING " WB_VERSION);
 
     /* One boot line per process: the PC compares it with the queued receipt to
@@ -1920,51 +2130,28 @@ int main(void) {
 
     bool local_released=false,remote_input_unknown=false,remote_select_down=false;uint64_t last_r1_poll=0;
     wb_panel_keys panel_keys={0};
+    idle_screen=(wb_idle_screen){.initialized=true,.last_activity_ms=now_ms()};
+    (void)sceTouchSetSamplingState(SCE_TOUCH_PORT_FRONT,SCE_TOUCH_SAMPLING_STATE_START);
+    (void)sceTouchSetSamplingState(SCE_TOUCH_PORT_BACK,SCE_TOUCH_SAMPLING_STATE_START);
     unsigned ui_seen=0; /* per-listener, bounded presentation evidence; no per-frame I/O */
     for (;;) {
         SceCtrlData pad = {0};
-        /* 01.92: the OLED-off timer is a SEPARATE timer from auto-suspend. Its
-         * expiry (about 3 min without local input) is reported by the platform
-         * as a system-UI overlay, which no signed focus bracket may accept and
-         * which cannot be dismissed from inside the app. Tick it every
-         * iteration, regardless of g_ssh.busy and of the guard grace, so an
-         * untouched console keeps a takeable bracket. */
-        (void)sceKernelPowerTick(SCE_KERNEL_POWER_TICK_DISABLE_OLED_OFF);
+        /* 02.07: local 15-minute display timer is separate from SSH lifetime. */
         uint64_t mono=now_ms();
         if(r1_source_live && (mono<last_r1_poll || mono-last_r1_poll>=1000)){
             last_r1_poll=mono;(void)r1_clock(r1_now());
         }
         const bool input = sceCtrlPeekBufferPositive(0, &pad, 1) > 0;
+        idle_screen_poll(mono,input,&pad);
         if (input && (pad.buttons & SCE_CTRL_START)) {
             owner_exit_from_listener = !g_ssh.busy && foreground(false);
-            (void)r1_revoke();
             reason = "USER EXIT"; break;
         }
-        if (!input && !a.remote_start) { reason = "LOCAL INPUT ERROR"; break; }
+        if (!input && !a.remote_start && !idle_screen.off) { reason = "LOCAL INPUT ERROR"; break; }
         if(!input){
             if(!remote_input_unknown)(void)log_event("REMOTE LOCAL INPUT UNKNOWN; SSH KEPT");
             remote_input_unknown=true;local_released=false;
         }else remote_input_unknown=false;
-        if(input && (pad.buttons&SCE_CTRL_SELECT))wb_notice_cancel(&r1_notice);
-        /* A positive SELECT observation remains a veto even when background
-         * input was unavailable before it. Never fabricate a neutral release,
-         * nor repeatedly toggle opt-out while the button stays held. */
-        if(a.remote_start && input && (pad.buttons&SCE_CTRL_SELECT)){
-            local_released=false;
-            if(pad.buttons==(SCE_CTRL_SELECT|SCE_CTRL_SQUARE)){
-                const bool ok=quick_switch(false);
-                ui_refresh(NULL,ok?"QUICK OPEN DISABLED":"QUICK DISABLE NOT SAVED");
-                /* Even failed persistence closes this listener. Do not claim
-                 * that a failed write has disabled a later cold start. */
-                reason=ok?"QUICK OPEN DISABLED":"QUICK DISABLE NOT SAVED";break;
-            }
-            if(!remote_select_down){
-                const bool disabled=wb_standing_veto();
-                const int rv=r1_revoke();
-                ui_refresh(NULL,rv==WB_OK&&disabled?"R1 AUTHORIZATION REVOKED":"R1 REVOKE ERROR");
-            }
-            remote_select_down=true;
-        }else if(input)remote_select_down=false;
 
         /* Only local foreground gestures change the viewport. Never inject a byte into the PTY. */
         if(input && wb_mirror_active()){
@@ -1974,25 +2161,7 @@ int main(void) {
                 else panel_keys=(wb_panel_keys){0};
             }
         }else panel_keys=(wb_panel_keys){0};
-
-        if(input && !pad.buttons)local_released=true;
-        else if(input && local_released){
-            local_released=false;
-            if(foreground(false) || (a.remote_start && (pad.buttons&SCE_CTRL_SELECT))){
-                if(pad.buttons==SCE_CTRL_TRIANGLE && !g_ssh.session){
-                    wb_notice_cancel(&r1_notice);review_return_local();
-                }
-                else if(pad.buttons==(SCE_CTRL_SELECT|SCE_CTRL_SQUARE)){
-                    bool enable=!quick_enabled();
-                    bool ok=quick_switch(enable);
-                    ui_refresh(NULL,!ok?"QUICK SETTING NOT SAVED":enable?"QUICK OPEN ENABLED":"QUICK OPEN DISABLED");
-                    if(ok && !enable){reason="QUICK OPEN DISABLED";break;}
-                }else if(pad.buttons==SCE_CTRL_SELECT){
-                    bool disabled=wb_standing_veto();
-                    int rv=r1_revoke();ui_refresh(NULL,rv==WB_OK&&disabled?"R1 AUTHORIZATION REVOKED":"R1 REVOKE ERROR");
-                }
-            }
-        }
+        (void)local_released; (void)remote_select_down; (void)last_r1_poll;
 
         /* Lock screen: keep the listener alive, absorb the power/RTC jump, and
          * stop the shell from suspending us. Strict mode keeps the old policy. */
@@ -2030,6 +2199,25 @@ int main(void) {
         }
         if (!served) { reason = "SSH ERROR"; break; }
 
+#ifdef WB_TTY_FILE
+        {
+            const int pace = wb_transfer_pace(&reason, &ui_seen);
+            if (pace < 0) break;
+            if (a.updater_accepted) {
+                int drain = wb_ssh_flush_handoff(&g_ssh);
+                wb_handoff_note("core voluntary-exit requested; tty-drain", drain);
+                sceKernelExitProcess(0);
+                return 0;
+            }
+            if (pace > 0 && !(a.restart_at && now_ms() >= a.restart_at)) continue;
+        }
+#endif
+        wb_boost_clocks(g_ssh.shell && g_ssh.shell->file);
+        {
+            const int space = wb_sftp_pace(idle_screen.off, &reason, &ui_seen);
+            if (space < 0) break;
+            if (space > 0 && !(a.restart_at && now_ms() >= a.restart_at)) continue;
+        }
         if (a.restart_at && now_ms() >= a.restart_at) {
             a.restart_at = 0;
             (void)log_event("APPLY CORE - LOADEXEC");
@@ -2040,14 +2228,16 @@ int main(void) {
             break;
         }
 
-        if (!g_ssh.listening) { reason = "LISTENER CLOSED"; break; }
-        if(r1_notice.pending){
-            const bool notice_focus=foreground(false);
-            if(wb_notice_ready(&r1_notice,g_ssh.session!=NULL,notice_focus,now_ms(),a.power_calls)){
-                review_return_expected(r1_notice.receipt);
-                local_released=false; /* next ordinary listener key also needs a fresh release */
+        if (idle_screen.off) {
+            if (!g_ssh.listening) {
+                reason = "LISTENER CLOSED";
+                break;
             }
+            sceKernelDelayThread(16000);
+            continue;
         }
+
+        if (!g_ssh.listening) { reason = "LISTENER CLOSED"; break; }
         phase_begin("PHASE DISPLAY PRESENT");
         const bool agent_online = g_ssh.authenticated && wb_ssh_connected(&g_ssh);
         const bool drew = display_terminal(a.pin,a.ui_line2,agent_online);
@@ -2062,6 +2252,7 @@ int main(void) {
     }
 
 out:
+    wb_boost_clocks(false);
     (void)log_event(reason);
     if (owner_exit_from_listener && wb_vita_exists(WB_PENDING_PATH)) {
         /* No direct promote from the mutable staging area on owner exit. */
@@ -2073,6 +2264,7 @@ out:
     wb_ssh_shutdown(&g_ssh);
     if (a.ctl) { sceNetCtlTerm(); a.ctl = false; }
     if (a.net) { sceNetTerm(); a.net = false; }
+    free(net_pool_raw); net_pool_raw = NULL;
     if (a.own_net_module) { sceSysmoduleUnloadModule(SCE_SYSMODULE_NET); a.own_net_module = false; }
     if (a.power_registered) scePowerUnregisterCallback(a.power_cb);
     if (a.power_cb >= 0) sceKernelDeleteCallback(a.power_cb);
@@ -2081,6 +2273,39 @@ out:
     (void)inactive_screen(reason);
     display_close();
     return 0;
+}
+
+static uint64_t op_xfer_t0, op_xfer_ms, op_ka_ms;
+static const char *op_xfer_tag;
+static void wb_op_progress(const char *tag, uint64_t done, uint64_t total) {
+    const uint64_t now = now_ms();
+    if (!op_ka_ms || now < op_ka_ms || now - op_ka_ms >= 400) {
+        op_ka_ms = now;
+        wb_ssh_keepalive(&g_ssh);
+    }
+    if (idle_screen.off || !total) return;
+    if (done == 0 || !op_xfer_t0 || op_xfer_tag != tag) {
+        op_xfer_tag = tag;
+        op_xfer_t0 = now;
+        op_xfer_ms = 0;
+    }
+    if (done < total && op_xfer_ms && now >= op_xfer_ms && now - op_xfer_ms < 120) return;
+    op_xfer_ms = now;
+    const uint64_t dt = now > op_xfer_t0 ? now - op_xfer_t0 : 1;
+    wb_xfer_ui m;
+    wb_xfer_format_pct(&m, tag, done, total, done * 1000u / dt);
+    const bool online = g_ssh.authenticated && wb_ssh_connected(&g_ssh);
+    (void)display_terminal_transfer(a.pin, a.ui_line2, online, &m, now);
+    if (done >= total) { op_xfer_t0 = 0; op_xfer_ms = 0; op_xfer_tag = NULL; }
+}
+static void wb_app_meter(const char *phase, uint64_t done, uint64_t total) {
+    const char *tag = (!phase || !strcmp(phase, "copy")) ? "APP COPY" :
+                      !strcmp(phase, "validate") ? "VALIDATE" : "EXTRACT";
+    wb_op_progress(tag, done, total);
+}
+static void wb_verify_pulse(uint64_t done, uint64_t total) {
+    wb_app_cooperate();
+    wb_op_progress("VERIFY", done, total);
 }
 
 /* WB_APPROVED_TABLE_BEGIN */

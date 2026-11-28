@@ -1,12 +1,13 @@
 """Bounded, no-merge send planning. No transport or SSH credentials in this module."""
 from __future__ import annotations
-import contextlib, os, stat
+import contextlib, hashlib, os, stat, tempfile
 from dataclasses import dataclass
-from itertools import islice
 from pathlib import Path
 
 ROOT = 'ux0:/VITA-POC'
-MAX_ENTRIES, MAX_DEPTH, MAX_BYTES = 256, 12, 192 * 1024 * 1024
+# The terminal/Vita regular-file contract is uint32, not a small batch quota.
+# Depth is constrained by quoted()'s canonical device pathname, not a toy count.
+MAX_BYTES = (1 << 32) - 1
 
 class TreeError(ValueError): pass
 
@@ -43,6 +44,41 @@ def checked_open(local, sig=None):
         yield file
 
 @dataclass(frozen=True)
+class FileSource:
+    """Private on-disk byte snapshot; callers must retain its owning context."""
+    path: Path
+    size: int
+    sha256: str
+    sig: tuple
+
+def file_digest(file, size):
+    """Hash a regular file with bounded reads and reject growth/short reads."""
+    digest=hashlib.sha256(); seen=0
+    while block:=file.read(65536):
+        seen+=len(block)
+        insist(seen<=size,'source grew while hashing')
+        digest.update(block)
+    insist(seen==size,'source changed or short while hashing')
+    return digest.hexdigest()
+
+@contextlib.contextmanager
+def file_snapshot(local, limit=MAX_BYTES):
+    """Copy/hash once into private disk storage, without loading a VPK into RAM."""
+    with tempfile.TemporaryDirectory(prefix='wb-source-') as tmp:
+        path=Path(tmp)/'source'
+        with checked_open(local) as src, path.open('xb') as dst:
+            before=os.fstat(src.fileno()); size=before.st_size
+            insist(0<size<=limit,'size-out-of-bounds')
+            digest=hashlib.sha256(); seen=0
+            while block:=src.read(65536):
+                seen+=len(block)
+                insist(seen<=size,'source grew while snapshotting')
+                dst.write(block); digest.update(block)
+            insist(seen==size and signature(os.fstat(src.fileno()))==signature(before),
+                   'source changed while snapshotting')
+        yield FileSource(path,size,digest.hexdigest(),signature(path.stat()))
+
+@dataclass(frozen=True)
 class Entry:
     local: Path
     remote: str
@@ -65,24 +101,21 @@ def plan(sources, dest, recursive, quoted):
     def walk(local, remote):
         nonlocal total
         quoted(remote)
-        insist(len(remote[len(ROOT)+1:].split('/'))<=MAX_DEPTH,'remote depth limit')
         key=remote.casefold()
         insist(key not in seen,'case-insensitive destination collision: '+remote)
-        insist(len(entries)<MAX_ENTRIES,'batch entry limit exceeded')
         seen.add(key); st=unlinked(local); directory=stat.S_ISDIR(st.st_mode)
         insist(directory or stat.S_ISREG(st.st_mode),'special source refused: '+str(local))
         entries.append(Entry(local,remote,directory,signature(st)))
         if not directory:
             total+=st.st_size
-            insist(0<=st.st_size<=MAX_BYTES and total<=MAX_BYTES,'batch byte limit exceeded')
+            insist(0<=st.st_size<=MAX_BYTES,'file exceeds Vita uint32 byte limit')
             return
         insist(recursive,'directories require --recursive (-r)')
         identity=(st.st_dev,st.st_ino)
         insist(identity not in dirs,'directory already visited (alias or overlapping roots)')
         dirs.add(identity)
         with os.scandir(local) as stream:
-            names=[entry.name for entry in islice(stream,MAX_ENTRIES-len(entries)+1)]
-        insist(len(names)<=MAX_ENTRIES-len(entries),'batch entry limit exceeded')
+            names=[entry.name for entry in stream]
         for name in sorted(names,key=lambda x:(x.casefold(),x)):
             walk(local/name,remote+'/'+name)
         insist(signature(unlinked(local))==signature(st),'directory changed during enumeration')

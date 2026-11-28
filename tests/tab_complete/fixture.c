@@ -72,7 +72,8 @@ int main(void){
     fails=1;tab("ls tic","ls tic");fails=0;
     absent=1;tab("python3 tic","python3 tic");absent=0;
     tab("python3 oth","python3 oth");assert(!strchr(output,27));
-    feed("\025abc\001");before=lists;feed("\t");assert(s.bad_line&&lists==before);feed("\025");
+    /* 02.18: Ctrl-A/E/K/W/L are readline keys; Ctrl-B is still an invalid control. */
+    feed("\025abc\002");before=lists;feed("\t");assert(s.bad_line&&lists==before);feed("\025");
     char longline[WB_SH_LINE];memset(longline,' ',sizeof longline-1);memcpy(longline+sizeof longline-3,"pw",2);longline[sizeof longline-1]=0;
     tab(longline,longline);
     puts("PASS denied path, traversal, injected/control/partial listings, unknown script, invalid/stretched lines");

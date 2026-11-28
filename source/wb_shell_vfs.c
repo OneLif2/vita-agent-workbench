@@ -1,4 +1,5 @@
 #include "wb_shell_vfs.h"
+#include "wb_game_logs_path.h"
 #include <psp2/io/dirent.h>
 #include <psp2/io/fcntl.h>
 #include <psp2/io/stat.h>
@@ -8,9 +9,25 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifdef __vita__
+enum { PATH_CAP=128, NAME_CAP=100, DEPTH_LIMIT=12, SCAN_LIMIT=4096,
+       LIST_BYTES=28672, CAT_BYTES=4096 };
+#else
 enum { PATH_CAP=128, NAME_CAP=100, DEPTH_LIMIT=12, SCAN_LIMIT=512,
        LIST_BYTES=8192, CAT_BYTES=4096 };
-enum area { BLOCKED, MOUNT_ROOT, INCOMING, DATA_ROOT, DIAG_DIR, DIAG_FILE };
+#endif
+enum area { BLOCKED, MOUNT_ROOT, INCOMING, DATA_ROOT, DIAG_DIR, DIAG_FILE, GAME_PARENT, GAME_LOGS, GENERAL };
+/* WB_SHELL2 (Workbench 2.0 production build): read-only projection of every
+ * ux0:/, ur0:/ and uma0:/ entry, except Workbench's private data directory
+ * (only the public diag files stay visible there). Writes are unchanged. */
+static size_t mount_len(const char *p){
+    if(!strncmp(p,"ux0:/",5))return 5;
+#ifdef WB_SHELL2
+    if(!strncmp(p,"ur0:/",5))return 5;
+    if(!strncmp(p,"uma0:/",6))return 6;
+#endif
+    return 0;
+}
 static const char *const ERR_DENIED="ERR access denied\n";
 static const char *const ERR_IO="ERR filesystem I/O\n";
 static const char *const ERR_LIMIT="ERR directory limit; use a narrower path\n";
@@ -31,9 +48,10 @@ static int diag_name(const char *n){
            !strcmp(n,"install.log")||!strcmp(n,"timeline.txt");
 }
 static enum area policy(const char *p){
-    if(!p||strncmp(p,"ux0:/",5)||strlen(p)>=PATH_CAP)return BLOCKED;
-    if(!p[5])return MOUNT_ROOT;
-    const char *s=p+5;unsigned depth=0;
+    const size_t m=p?mount_len(p):0;
+    if(!m||strlen(p)>=PATH_CAP)return BLOCKED;
+    if(!p[m])return MOUNT_ROOT;
+    const char *s=p+m;unsigned depth=0;
     for(;;){
         const char *end=strchr(s,'/');size_t n=end?(size_t)(end-s):strlen(s);
         if(++depth>DEPTH_LIMIT||!name_ok(s,n))return BLOCKED;
@@ -42,10 +60,17 @@ static enum area policy(const char *p){
     }
     if(!strcmp(p,"ux0:/VITA-POC")||!strncmp(p,"ux0:/VITA-POC/",14))return INCOMING;
     if(!strcmp(p,"ux0:/data"))return DATA_ROOT;
+    if(wb_game_data_parent(p))return GAME_PARENT;
+    if(wb_game_logs_path(p))return GAME_LOGS;
     if(!strcmp(p,"ux0:/data/INAP00018"))return DIAG_DIR;
     const char root[]="ux0:/data/INAP00018/";
     if(!strncmp(p,root,sizeof root-1)&&diag_name(p+sizeof root-1))return DIAG_FILE;
+#ifdef WB_SHELL2
+    if(!strncmp(p,"ux0:/data/INAP00018",19))return BLOCKED; /* private identity */
+    return GENERAL;
+#else
     return BLOCKED;
+#endif
 }
 static int is_regular(const SceIoStat *st){
     return SCE_S_ISREG(st->st_mode)&&st->st_size>=0;
@@ -53,6 +78,8 @@ static int is_regular(const SceIoStat *st){
 static int typed(enum area a,const SceIoStat *st,const char *p){
     if(a==BLOCKED)return 0;
     if(a==DIAG_FILE)return is_regular(st);
+    if(a==GENERAL)return is_regular(st)||SCE_S_ISDIR(st->st_mode);
+    if(a==GAME_LOGS&&!wb_game_logs_exact(p))return is_regular(st)||SCE_S_ISDIR(st->st_mode);
     if(a==INCOMING&&strcmp(p,"ux0:/VITA-POC"))return is_regular(st)||SCE_S_ISDIR(st->st_mode);
     return !!SCE_S_ISDIR(st->st_mode);
 }
@@ -61,8 +88,9 @@ static int typed(enum area a,const SceIoStat *st,const char *p){
 static const char *lookup(const char *p,enum area a,SceIoStat *st){
     if(a==BLOCKED)return ERR_DENIED;
     if(a==MOUNT_ROOT)return NULL; /* trusted platform mount */
-    char parent[PATH_CAP]="ux0:/";size_t used=5;
-    const char *s=p+5;unsigned budget=SCAN_LIMIT;
+    const size_t m=mount_len(p);
+    char parent[PATH_CAP];size_t used=m;memcpy(parent,p,m);parent[m]=0;
+    const char *s=p+m;unsigned budget=SCAN_LIMIT;
     while(*s){
         const char *slash=strchr(s,'/');size_t len=slash?(size_t)(slash-s):strlen(s);
         int fd=sceIoDopen(parent);if(fd<0)return ERR_IO;
@@ -83,13 +111,22 @@ static const char *lookup(const char *p,enum area a,SceIoStat *st){
         }
         if(sceIoDclose(fd)<0)return ERR_IO;
         if(error||!slash)return error;
-        if(used>5)parent[used++]='/';
+        if(used>m)parent[used++]='/';
         memcpy(parent+used,s,len);parent[used+=len]=0;s=slash+1;
     }
     return ERR_IO;
 }
 static int err(wb_out *o,const char *why){
     return wb_out_puts(o,why)==0?1:-1;
+}
+int wb_vita_shell_open_game_log(const char *p,int *fd){
+    if(!fd)return -1;
+    *fd=-1;
+    const enum area a=policy(p);SceIoStat st={0};
+    if(a!=GAME_LOGS||lookup(p,a,&st)||!is_regular(&st))return -1;
+    const int opened=sceIoOpen(p,SCE_O_RDONLY,0);
+    if(opened<0)return -1;
+    *fd=opened;return 0;
 }
 int wb_vita_shell_isdir(void *ctx,const char *p,wb_out *out){
     (void)ctx;enum area a=policy(p);SceIoStat st={0};const char *e=lookup(p,a,&st);

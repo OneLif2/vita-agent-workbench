@@ -56,6 +56,7 @@ bool wb_ssh_existing_pin(char out[65]);
 int  wb_ssh_prepare(wb_ssh *s, const char *user_pin_hex, bool allow_new_identity);
 int  wb_ssh_open(wb_ssh *s, const char *ip, uint16_t port, const char (*peers)[16], int peer_count);
 int  wb_ssh_service(wb_ssh *s, wb_core *core);
+void wb_ssh_keepalive(wb_ssh *s); /* nonblocking global keepalive reply during long disk/hash ops */
 int  wb_ssh_flush_handoff(wb_ssh *s); /* bounded, output-only; no command dispatch */
 void wb_ssh_end_session(wb_ssh *s);
 void wb_ssh_close_listener(wb_ssh *s);

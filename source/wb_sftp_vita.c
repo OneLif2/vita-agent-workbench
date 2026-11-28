@@ -3,11 +3,16 @@
 #include <psp2/io/dirent.h>
 #include <psp2/io/fcntl.h>
 #include <psp2/io/stat.h>
+#include <stdlib.h>
 #include <string.h>
 
 /* Bounded per lookup (all components combined). Listing uses an existing
  * directory handle and does not require a scan per returned entry. */
+#ifdef __vita__
+enum { LOOKUP_LIMIT=4096, DEPTH_LIMIT=12 };
+#else
 enum { LOOKUP_LIMIT=512, DEPTH_LIMIT=12 };
+#endif
 
 static int native_status(int rc) {
     if ((uint32_t)rc==UINT32_C(0x80010002)) return WB_SFTP_NO_FILE;
@@ -102,6 +107,22 @@ static int v_stat(void *ctx,const char *path,wb_sftp_attr *attr) {
     char native[WB_CMD_ARG_MAX];
     return resolve(path,native,attr);
 }
+#ifdef __vita__
+enum { SFTP_RBUF_SIZE = 262144u };
+static struct {
+    int fd;
+    uint64_t off;
+    size_t len;
+    uint8_t *buf;
+} sftp_rcache = { .fd = -1 };
+static void sftp_rcache_drop(int fd, bool free_buf) {
+    if (sftp_rcache.fd == fd) { sftp_rcache.fd = -1; sftp_rcache.len = 0; }
+    if (free_buf && sftp_rcache.fd < 0 && sftp_rcache.buf) {
+        free(sftp_rcache.buf);
+        sftp_rcache.buf = NULL;
+    }
+}
+#endif
 static int v_open(void *ctx,const char *path,int dir,int *fd) {
     (void)ctx;
     if (!fd) return WB_SFTP_FAILURE;
@@ -112,11 +133,17 @@ static int v_open(void *ctx,const char *path,int dir,int *fd) {
     if (attr.is_dir!=dir) return WB_SFTP_DENIED;
     int opened=dir?sceIoDopen(native):sceIoOpen(native,SCE_O_RDONLY,0);
     if (opened<0) return native_status(opened);
+#ifdef __vita__
+    if (!dir) sftp_rcache_drop(opened, false);
+#endif
     *fd=opened;
     return WB_SFTP_OK;
 }
 static int v_close(void *ctx,int fd,int dir) {
     (void)ctx;
+#ifdef __vita__
+    if (!dir) sftp_rcache_drop(fd, true);
+#endif
     return (dir?sceIoDclose(fd):sceIoClose(fd))<0 ? WB_SFTP_FAILURE : WB_SFTP_OK;
 }
 static int v_read(void *ctx,int fd,uint64_t off,uint8_t *buf,size_t cap,size_t *got) {
@@ -124,6 +151,31 @@ static int v_read(void *ctx,int fd,uint64_t off,uint8_t *buf,size_t cap,size_t *
     if (!got || !buf || cap>WB_SFTP_DATA_MAX || off>INT64_MAX) return WB_SFTP_FAILURE;
     *got=0;
     if (!cap) return WB_SFTP_OK;
+#ifdef __vita__
+    if (sftp_rcache.fd == fd && sftp_rcache.buf &&
+        off >= sftp_rcache.off && off < sftp_rcache.off + sftp_rcache.len) {
+        size_t pos = (size_t)(off - sftp_rcache.off);
+        size_t avail = sftp_rcache.len - pos;
+        size_t take = cap < avail ? cap : avail;
+        memcpy(buf, sftp_rcache.buf + pos, take);
+        *got = take;
+        return WB_SFTP_OK;
+    }
+    if (!sftp_rcache.buf) sftp_rcache.buf = (uint8_t *)malloc(SFTP_RBUF_SIZE);
+    if (sftp_rcache.buf) {
+        if (sceIoLseek(fd,(SceOff)off,SCE_SEEK_SET)!=(SceOff)off) return WB_SFTP_FAILURE;
+        int n = sceIoRead(fd, sftp_rcache.buf, SFTP_RBUF_SIZE);
+        if (n < 0 || (size_t)n > SFTP_RBUF_SIZE) { sftp_rcache_drop(fd, false); return WB_SFTP_FAILURE; }
+        if (n == 0) { sftp_rcache_drop(fd, false); return WB_SFTP_EOF; }
+        sftp_rcache.fd = fd;
+        sftp_rcache.off = off;
+        sftp_rcache.len = (size_t)n;
+        size_t take = cap < (size_t)n ? cap : (size_t)n;
+        memcpy(buf, sftp_rcache.buf, take);
+        *got = take;
+        return WB_SFTP_OK;
+    }
+#endif
     if (sceIoLseek(fd,(SceOff)off,SCE_SEEK_SET)!=(SceOff)off) return WB_SFTP_FAILURE;
     int n=sceIoRead(fd,buf,(SceSize)cap);
     if (n<0 || (size_t)n>cap) return WB_SFTP_FAILURE;
@@ -173,6 +225,7 @@ const wb_sftp_ops wb_sftp_vita_ops={
  * against the digest of wire bytes before publishing (no replacing rename). */
 #include "wb_tty_file.h"
 #include <stdlib.h>
+#define WB_SFTP_SHA_UPDATE(c,p,n) wb_sha256_update((c),(p),(n))
 typedef struct { void *disk; wb_sha256 hash; } sftp_upload;
 static int write_path(const char *path,char native[WB_CMD_ARG_MAX]){
     if(!path||path[0]!='/'||!path[1]||strlen(path)>=WB_CMD_ARG_MAX-(sizeof WB_INCOMING-1))return 0;
@@ -189,18 +242,30 @@ static int create_open(void *ctx,const char *path,void **out){
     sftp_upload *u=calloc(1,sizeof *u);if(!u)return WB_SFTP_FAILURE;
     const char *why=wb_tty_vopen_stream(native,&u->disk);
     if(why){free(u);return create_rc(why);}
-    wb_sha256_init(&u->hash);*out=u;return WB_SFTP_OK;
+#ifndef __vita__
+    wb_sha256_init(&u->hash);
+#endif
+    *out=u;return WB_SFTP_OK;
 }
 static int create_write(void *ctx,void *upload,const uint8_t *data,size_t n){
     (void)ctx;sftp_upload *u=upload;
     const char *why=wb_tty_vwrite(u->disk,data,n);
-    if(!why)wb_sha256_update(&u->hash,data,n);
+#ifndef __vita__
+    if(!why)WB_SFTP_SHA_UPDATE(&u->hash,data,n);
+#endif
     return create_rc(why);
 }
 static int create_finish(void *ctx,void *upload,int commit){
-    (void)ctx;sftp_upload *u=upload;uint8_t digest[32];char hex[65];
+    (void)ctx;sftp_upload *u=upload;
+#ifdef __vita__
+    /* Core 1 async writer hashes every sequential wire block in parallel with SSH decrypt. */
+    int rc=create_rc(wb_tty_vfinish(u->disk,commit!=0,NULL));
+#else
+    uint8_t digest[32];char hex[65];
     if(commit){wb_sha256_final(&u->hash,digest);wb_sha_hex(digest,sizeof digest,hex);}
-    int rc=create_rc(wb_tty_vfinish(u->disk,commit!=0,commit?hex:NULL));free(u);return rc;
+    int rc=create_rc(wb_tty_vfinish(u->disk,commit!=0,commit?hex:NULL));
+#endif
+    free(u);return rc;
 }
 static int create_dir(void *ctx,const char *path){
     (void)ctx;char native[WB_CMD_ARG_MAX];

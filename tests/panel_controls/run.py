@@ -5,9 +5,11 @@ HERE=Path(__file__).resolve().parent;SRC=HERE.parents[1]/'source'
 s=(SRC/'vita_ssh_status.c').read_text()
 origin=s.index('const bool input = sceCtrlPeekBufferPositive')
 a=s.index('        if(input && wb_mirror_active()){',origin)
-b=s.index('        if(input && !pad.buttons)local_released=true;',a)
+b=s.index('        (void)local_released;',a)
 assert 'SCE_CTRL_START' in s[origin:a]
-assert 'pad.buttons==SCE_CTRL_TRIANGLE' in s[b:] and 'SCE_CTRL_SELECT|SCE_CTRL_SQUARE' in s[b:]
+# 02.18: no TRIANGLE review / SELECT revoke / SELECT+SQUARE quick toggles remain in the listener.
+loop=s[origin:s.index('\nout:',origin)]
+assert 'pad.buttons==SCE_CTRL_TRIANGLE' not in loop and 'SCE_CTRL_SELECT|SCE_CTRL_SQUARE' not in loop
 display=(SRC/'display.c').read_text()
 assert 'wb_panel_cache mirror_cache;' in display and 'f->mirror_cache.valid=false;' in display
 with tempfile.TemporaryDirectory() as tmp:

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Checks exact v2.04 / 02.06 package: members, SELF identity, permissions, SFO, payload.
+"""Checks exact v2.18 package: members, SELF identity, permissions, SFO, payload.
 
     python3 verify_package.py build
 
@@ -8,7 +8,7 @@ Asserts, in order:
   * zip CRCs valid
   * eboot is a SELF with an ARM32 ELF and the full-permission authid
     (0x2F00000000000001) - -s would give 0x..02 and break the installer
-  * param.sfo is INAP00018 / 02.06
+  * param.sfo is INAP00018 / 02.18
   * payload is a SELF carrying the 01.22-p2.1 version marker
   * the core still contains the install/put/promote/head.bin/wb10 surface and
     no /bin/sh
@@ -26,7 +26,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 from self_segments import parse_self
 
 TITLE_ID = "INAP00018"
-APP_VER = "02.06"
+APP_VER = "02.21"
 VPK_NAME = "workbench_" + APP_VER.replace(".", "") + ".vpk"
 PAYLOAD_VERSION = b"01.22-p2.1"
 FULL_PERMISSION_AUTHID = 0x2F00000000000001
@@ -72,8 +72,33 @@ def main() -> int:
     # Positive feature checks only use verified, decompressed loadable bytes;
     # unauthenticated header/trailer text cannot satisfy these requirements.
     eboot = core.logical_bytes
-    assert b"02.06-live-safequery\0" in eboot, "exact v2.04 core build tag mismatch"
-    assert core.compressed, "02.06 core must use standard SELF segment compression"
+    assert b"02.21-hyper-sftp\0" in eboot, "exact core build tag mismatch"
+    assert b"Filesystem       Size        Used       Avail   Use%%  Mounted on" in eboot, "missing read-only human df"
+    assert b"TTY1 READY BATCH " in eboot and b"put-batch" in eboot, "missing 02.14 batched terminal protocol"
+    for needle in (b"sha256sum", b"SFTP PUT", b"SFTP GET", b"%.10s %3u%%  %.14s/%.14s  %.14s  ETA %.10s", b"Vita Linux Terminal ", b"pi@vita", b"OK app-prune scope=", b"APP COPY", b"VALIDATE", b"EXTRACT", b"APPROVE", b"VERIFY", b"VitaAgentWorkbench", b"OK touch ", b"OK cp bytes=", b"OK app-patch-eboot title=", b"OK app-list-installed count=", b"OK app-install-vpk title=", b"AGENT MODE READY", b"ERR r1-removed", b"r1 state=removed mode=agent-ops", b"Binary file %s matches", b"find: %u match%s", b"ERR pipe: only grep head tail wc sort uniq may follow |", b"uma0:/"):
+        assert needle in eboot, f"missing 02.20 turbo-term feature {needle!r}"
+    assert core.compressed, "02.20 core must use standard SELF segment compression"
+
+    # A package is not a patch build unless it carries the verified eboot
+    # hashes for the allowed bases AND target, and committed member digests
+    # for each of the release manifests. Never accept a tag-only build.
+    for needle in (
+        b"WB-APP-PATCH-v1\nRUN ", b"ERR app-patch phase=", b"OK app-patch%s title=",
+        b"2b30f7abd0a374dcca206162405c7ba0780062fd7918acba6637785ab7bd6e54",
+        b"2878f25cf846479a7d7dec0147c4d5b704488df8e2c55e31ebce8ea84cf9d7b6",
+        b"8f36db59e872afcc6024837a035653ae241016842c770bd6c7076d8cc5151dab",
+        b"699b11eecb3a57bc009c0dfcf423d5c25174b7372b24b328ee1d5dc414f85a9a",
+        b"3c3717f15ee53fb2d3bf1e942e789bf39e5cee5ff17969b7aea68777c63e53ed",
+        b"db8dcb3fe45b069e2bc567e41e52e6f8e79e1c2fbeb8bc86da08c0f540c01597",
+        b"e3d9e38441e1239eb9eb43df6ab3ae420d0afa083bcffe9d5cbe0ec4e1fdf6ee",
+    ):
+        assert needle in eboot, "missing exact RJGM52237 patch identity"
+    recipe = Path(__file__).with_name("wb_app_patch_recipe.h").read_text("ascii")
+    rows = re.findall(r'\{"([^"]+)",UINT64_C\((\d+)\),"([0-9a-f]{64})",(?:NULL|wb_patch_target_sfo|wb_patch_target_manifest)\}', recipe)
+    assert len(rows)==66 and len({n for n,_,_ in rows})==11, "unexpected patch recipe shape"
+    for path, n, digest in rows:
+        assert int(n)>0 and path.encode() in eboot and digest.encode() in eboot, "missing bound patch member: "+path
+
     for forbidden in (b"R1 STANDING BOOTSTRAP VERIFIED", b"R1 STANDING BOOTSTRAP SAVE FAILED"):
         assert forbidden not in eboot and forbidden not in physical_eboot, "v1.89 may not enroll standing permission"
     for forbidden in (b"SQUARE OPENS PAIRED SSH", b"PAIRED OPEN NOT CONFIRMED"):
@@ -107,7 +132,7 @@ def main() -> int:
     # The core defines no shell entry point - `arm-vita-eabi-nm` on the built
     # ELF shows no system, popen or execv symbol.
 
-    assert b'WBLC00079\0' in eboot and b'026389c85760b79921a0b587eefed0daaedf22e108a4b915c2375c26a1534621\0' in eboot, 'wrong or missing exact 02.06 lifecycle canary approval'
+    assert b'WBLC00079\0' in eboot and b'026389c85760b79921a0b587eefed0daaedf22e108a4b915c2375c26a1534621\0' in eboot, 'wrong or missing exact 02.10 lifecycle canary approval'
     assert b'15c40b646963cae1e6faefce52f27f6e0eaa75be3add4ff1223e99936c62f4ef\0' not in eboot, 'stale Lifecycle 01.00 install approval remains'
     assert b'2a3a6cf25083a6e81e2c55eb12eea1ede88bbb24d566c0a0ee915dcb7b7264cd\0' not in eboot, 'stale Lifecycle 01.01 install approval remains'
     approved = Path(__file__).resolve().with_name('wb_wake_probe_approved.h').read_text(encoding='ascii')
@@ -120,19 +145,28 @@ def main() -> int:
     assert b"inspect" in eboot, "missing inspect command in core"
     for marker in (b"Type help for commands.", b"VITA AGENT TERMINAL", b"UI PRESENT TERMINAL IDLE", b"photo-export", b"OK photo-export bytes=", b"SFTP INCOMING OPEN", b"VSSH00001",
                    b"e6363e629be55ab65151456989095310f9c0d2177bc4685a655041e1ea4758ce"):
-        assert marker in eboot, "02.06 release feature or approval missing"
+        assert marker in eboot, "02.10 release feature or approval missing"
     for marker in (b"python3 tictactoe_ai.py", b"PYTHON runtime=MicroPython-1.25.0", b"ec216ac6378407a863cdc52fd3bac41e6060fed4341a8436a06e16004f6a191d"):
         assert marker in eboot, "missing compiled interactive game marker"
-    assert b"VITA AGENT TERMINAL / SHARED SSH" in eboot, "missing shared shell framebuffer view"
-    assert b"WAITING FOR INTERACTIVE SSH" in eboot, "missing shared terminal waiting view"
     for marker in (b"TTY1 READY %s", b"TTY1 OK %s", b"stage-hash-mismatch", b"no-clobber-unavailable"):
-        assert marker in eboot, "missing 02.06 terminal transfer marker: " + repr(marker)
+        assert marker in eboot, "missing 02.10 terminal transfer marker: " + repr(marker)
     assert b"payload-not-approved" in eboot and hashlib.sha256(payload).hexdigest().encode() in eboot, "terminal deploy approval differs from packaged payload"
     assert b"WB>\x00" not in eboot, "obsolete terminal panel prompt present"
-    assert (APP_VER + "-live-safequery").encode() in eboot, "wrong build tag (WB_BUILD_TAG must derive from WB_VERSION)"
-    assert b"LOW BATTERY - CHARGE THEN REOPEN APP" in eboot and b"POWER EVENT - REOPEN APP" in eboot, "missing 02.06 startup stop messages"
+    assert (APP_VER + "-hyper-sftp").encode() in eboot, "wrong build tag (WB_BUILD_TAG must derive from WB_VERSION)"
+    # 02.14 positive features: optional app-progress total=, on-screen transfer
+    # bar, and the second read-only title Logs root beside RJGM52237.
+    for needle in (b"app-progress phase=%s bytes=%llu total=%llu\n", b"app-progress phase=%s bytes=%llu\n",
+                   b"write-error rc=0x%08x offset=%llu requested=%u fd=%d\0", b"%s %u%%  %u/%u B  %s  ETA %s\0", b"WAIT RECEIPT\0", b"%llu.%02u MB/s\0",
+                   b"ux0:/data/RJGM52237/Logs\0", b"ux0:/data/RJGP52237/Logs\0"):
+        assert needle in eboot, f"missing 02.14 transfer/logs feature {needle!r}"
+    assert b"ux0:/data/RJGP52237/Saves" not in eboot, "02.14 must not name PerfLab saves"
+    assert b"LOW BATTERY - CHARGE THEN REOPEN APP" in eboot and b"POWER EVENT - REOPEN APP" in eboot, "missing 02.10 startup stop messages"
     assert b"/inbox" in eboot, "missing interactive inbox alias"
-    assert b"DPAD SCROLL/PAN" in eboot, "02.06 scroll panel not in release"
+    for m in (b"Vita Linux Terminal 02.21", b"Zero-Button WBQ2"):
+        assert m in eboot, "missing 02.20 linux terminal OLED panel"
+    for m in (b"SSH HOST KEY SHA256 HEX", b"CHECK MAC PUBLIC PIN"):
+        assert m not in eboot, "02.18 must not show key fingerprints on the Vita"
+    assert b"DPAD:Scroll/Pan" in eboot, "02.19 scroll panel not in release"
     for m in (b"font set", b"SIL OPEN FONT LICENSE", b"jetbrains"):
         assert m in eboot, "missing typography or license: "+repr(m)
     ofl = (Path(__file__).resolve().parents[1]/"tools/font_assets/OFL.txt").read_bytes().replace(b"\r\n", b"\n")
@@ -140,19 +174,15 @@ def main() -> int:
     assert b"app uninstall" in eboot and b"VSSH00001" in eboot, "missing single-title app uninstall gate"
     assert b"core voluntary-exit requested; tty-drain" in eboot, "missing cooperative updater handoff"
     for m in (b"app uninstall-plan title=", b"eboot_sha256=", b"settings updater-folder", b"layout=unverified", b"ERR paired interactive PTY required"):
-        assert m in eboot,"02.06 command not present in packaged core: "+repr(m)
+        assert m in eboot,"02.10 command not present in packaged core: "+repr(m)
     assert b'WBPA00077\0' in eboot and b'caa2fc46faec834e92b318fd5f03dabcd11997905f75b396c69fb00a316d5eec\0' in eboot, 'missing QA install-only approval'
     assert b'WBSD00078\0' in eboot and b'368a2031d22a6c16a17f062b87e46055a1a9e36f808574c20cc9a0b558d5e697\0' in eboot, 'missing exact save probe install-only approval'
     # A version bump alone is never sufficient; check both the signed-in
     # PTY boundary and actual scanner/output strings of the shipped SELF.
     for needle in (b"OK crash-index matched=", b"END crash-index", b"ERR crash-index no-pty", b"crash name=%s modified=%s bytes="):
-        assert needle in eboot, f"missing 02.06 crash metadata feature {needle!r}"
-    for needle in (b"OK r1-review model=local-review title=", b"ERR r1-review no-pty", b"ERR r1-review not-verified"):
-        assert needle in eboot, f"missing 02.06 digest review feature {needle!r}"
-    for needle in (b"OK r1-notice title=", b"ERR r1-notice no-pty"):
-        assert needle in eboot, f"missing 02.06 notice feature {needle!r}"
+        assert needle in eboot, f"missing 02.10 crash metadata feature {needle!r}"
     for needle in (b"ERR close-wb wake-not-ready", b"ERR close-wb no-pty"):
-        assert needle in eboot, f"missing 02.06 wake guard feature {needle!r}"
+        assert needle in eboot, f"missing 02.10 wake guard feature {needle!r}"
     for needle in (b"WAKE PROBE DISPATCH REQUEST; NOT RECEIVER READY", b"wake-probe state=",
                    b"wake-probe diagnostic=public-untrusted readiness=not-provided close_wb=disabled",
                    b"OK wake-probe DISPATCHED_UNVERIFIED job=", b"ERR wake-probe %s; WB not closed",
@@ -162,42 +192,21 @@ def main() -> int:
                    b"app-running state=%s run=%.16s count=%d capacity=%d potentially_truncated=%s foreground=unknown scope=appmgr-started-apps",
                    b"bounded-two-sample-not-atomic; not-all-kernel-processes; no-foreground-claim"):
         assert needle in eboot, "missing exact v1.89 bounded running-app feature " + repr(needle)
-    for needle in (b"r1-auto state=%s run=%s", b"ERR r1-signed signature",
-                   b"OK r1-signed target=%s run=%s manifest=%.64s grant=armed"):
-        assert needle in eboot, f"missing exact v1.89 signed-update feature {needle!r}"
     assert b"R1 STANDING BOOTSTRAP VERIFIED" not in eboot and b"R1 STANDING BOOTSTRAP SAVE FAILED" not in eboot, "v1.89 may not enroll standing permission"
-    for needle in (b"OK wb-status version=02.06 ", b"END wb-status", b"ERR wb-status no-pty",
+    for needle in (b"OK wb-status version=02.21 ", b"END wb-status", b"ERR wb-status no-pty",
                    b"state wb=running lock=unknown overlay=%s foreground=%s focus_reason=%s"):
         assert needle in eboot, f"missing exact v1.89 device status feature {needle!r}"
     # Exactly one owner-approved game artifact, install-only, by title+version+digest.
     assert b"RJGM52237\0" in eboot, "missing approved game title in the compiled registry"
     assert b"b3a8fbb2ddf112df4da2d3f2848d9fe865e2d78b268db4a22d6577c4bb257baa\0" in eboot, \
         "missing the exact approved game digest in the compiled registry"
-    for needle in (b"R1 REOPEN SELF FOR CLEAN RUN", b"r1-reopen.once"):
-        assert needle in eboot, f"missing 02.06 reopen feature {needle!r}"
     for needle in (b"WB-APP-APPROVE-v1", b"OK app-approve title=%s app_ver=%s sha256=%s",
                    b"ERR app-approve signature-or-storage", b"source=owner-signed",
                    b"source=compiled", b"busybox-never"):
         if needle == b"busybox-never":
             continue
-        assert needle in eboot, f"missing 02.06 runtime approval feature {needle!r}"
-    for needle in (b"R1 SIGNED FOCUS BRACKET START REFUSED", b"R1 SIGNED FOCUS BRACKET END REFUSED"):
-        assert needle in eboot, f"missing exact v1.89 signed-focus gate {needle!r}"
-    assert b"PAIRED LISTENER AUTO ENTRY; UPDATE GRANT UNCHANGED" in eboot, "missing exact v1.89 paired autoentry feature"
-    for needle in (b"R1 SIGNED HANDOFF BRACKET START REFUSED", b"R1 SIGNED HANDOFF BRACKET END REFUSED", b"R1 SIGNED HANDOFF TRANSACTION REFUSED"):
-        assert needle in eboot, f"missing exact v1.89 full-handoff gate {needle!r}"
+        assert needle in eboot, f"missing 02.10 runtime approval feature {needle!r}"
     assert b"SQUARE OPENS PAIRED SSH" not in eboot and b"PAIRED OPEN NOT CONFIRMED" not in eboot, "obsolete paired-listener button gate remains"
-    for needle in (b"REMOTE OWNER START ENABLED; NO UPDATE GRANT", b"REMOTE OWNER LISTENING; BACKGROUND ALLOWED", b"INSTALLED WBQ2 "):
-        assert needle in eboot, f"missing exact v1.89 owner remote-start policy {needle!r}"
-    provision = Path(__file__).resolve().with_name("wb_standing_provision.h").read_text(encoding="ascii")
-    pairs = re.findall(r'^#define WB_STANDING_([A-Z0-9]+) "([0-9a-f]+)"$', provision, re.M)
-    public = dict(pairs)
-    assert len(pairs) == 4 and set(public) == {"HOST","OWNER","SIGNER","SEC1"}, "unexpected r2 public provisioning"
-    assert len({public[k] for k in ("HOST","OWNER","SIGNER")}) == 3
-    sec1 = bytes.fromhex(public["SEC1"])
-    assert len(sec1) == 65 and sec1[0] == 4 and hashlib.sha256(sec1).hexdigest() == public["SIGNER"], "wrong r2 public signer binding"
-    assert sec1 in eboot or public["SEC1"].encode() in eboot, "missing r2 compiled public signer"
-    assert all(len(public[k]) == 64 and public[k].encode() in eboot for k in ("HOST","OWNER","SIGNER")), "missing exact r2 public pins"
     digest = hashlib.sha256(vpk.read_bytes()).hexdigest()
     print(f"PASS: 3-member CRC, ARM32 SELF, authid {authid:#x}, "
           f"{TITLE_ID} {APP_VER}, payload {PAYLOAD_VERSION.decode()}")

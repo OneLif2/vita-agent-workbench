@@ -16,6 +16,7 @@ enum {W=960,H=544,PITCH=1024,FB_BYTES=9*256*1024};
 #include "screen.inc"
 #include "wb_screen_mirror.h"
 #include "mirror_panel.inc"
+#include "wb_xfer_panel.inc"
 #include "wb_panel_cache.h"
 static struct Frame {
     void *data;
@@ -24,6 +25,7 @@ static struct Frame {
     SceUID id;
     bool mapped;
     wb_panel_cache mirror_cache;
+    wb_xfer_ui meter;
 } buf[2]={{.id=-1},{.id=-1}};
 static unsigned cursor=1;
 static bool gxm,app_util;
@@ -82,28 +84,39 @@ int display_init(void) {
     }
     return 1;
 }
+static uint64_t last_xfer_present;
 static int frame(const char *label,const char *pin,int dialog,const char *hint,
-                 bool terminal,bool agent_online){
+                 bool terminal,bool agent_online,bool transfer,const wb_xfer_ui *meter,uint64_t now){
     struct Frame *f=&buf[cursor];
     uint32_t *pixels=f->data;
     const uint32_t fg=COLOR(224,235,227);
     const uint32_t bg=terminal?LIVE_TERMINAL_BG:COLOR(16,24,38);
     if(terminal){
-        if(wb_panel_needs_raster(&f->mirror_cache,wb_mirror_revision(),agent_online,pin,hint)){
+        const struct Frame *shown=&buf[cursor^1];
+        if(!agent_online||wb_mirror_browsing())meter=NULL;
+        /* Only skip if the DISPLAYED buffer already has this exact image;
+         * the back buffer may still contain a different revision. Retain a
+         * periodic heartbeat and never skip dialogs, idle or wake transitions. */
+        if(transfer && last_xfer_present && now>=last_xfer_present && now-last_xfer_present<1000 &&
+           wb_panel_matches(&shown->mirror_cache,wb_mirror_revision(),agent_online,pin,hint) &&
+           wb_xfer_matches(shown->meter.text[0]?&shown->meter:NULL,meter))return 1;
+        const bool base_dirty=wb_panel_needs_raster(&f->mirror_cache,wb_mirror_revision(),agent_online,pin,hint);
+        const bool meter_dirty=!wb_xfer_matches(f->meter.text[0]?&f->meter:NULL,meter);
+        if(base_dirty||(!meter&&meter_dirty)){
             for(unsigned i=0;i<PITCH*H;i++)pixels[i]=bg;
             draw_mirror(pixels,pin,hint,agent_online);
         }
+        if(meter && (base_dirty||meter_dirty))wb_xfer_draw(pixels,meter);
+        if(meter)f->meter=*meter;else f->meter.text[0]=0;
     }else{
         f->mirror_cache.valid=false;
+        f->meter.text[0]=0;
         for(unsigned i=0;i<PITCH*H;i++)pixels[i]=bg;
+        (void)pin; /* Host key fingerprint is shown in the PC terminal, not on Vita. */
         draw(pixels,35,4,"VITA AGENT WORKBENCH",COLOR(250,240,220));
-        draw(pixels,120,3,label,COLOR(120,255,163));
-        if(pin) {
-            draw(pixels,185,3,!strncmp(label,"R1 UPDATE ",10)?"APPROVED STAGE MANIFEST SHA256":!strcmp(label,"CHECK MAC PUBLIC PIN")?"MAC USER KEY SHA256 HEX":"SSH HOST KEY SHA256 HEX",fg);
-            draw(pixels,235,2,pin,fg);
-            draw(pixels,335,3,!strncmp(label,"R1 UPDATE ",10)?"ONE RETURN / 8 HOURS / SELECT CANCELS":"192.0.2.10:2222",fg);
-        }
-        if(hint)draw(pixels,385,3,hint,fg);
+        draw(pixels,130,3,label,COLOR(120,255,163));
+        draw(pixels,220,3,"192.0.2.10:2222 - AGENT MODE",fg);
+        if(hint)draw(pixels,320,3,hint,fg);
         if(!dialog)draw(pixels,435,3,"START EXITS",fg);
     }
     if(dialog) {
@@ -117,13 +130,17 @@ static int frame(const char *label,const char *pin,int dialog,const char *hint,
     if(sceGxmPadHeartbeat(&f->surface,f->sync)<0||
        sceGxmDisplayQueueAddEntry(buf[cursor^1].sync,f->sync,&f->data)<0||
        sceGxmDisplayQueueFinish()<0)return 0;
+    last_xfer_present=transfer?now:0;
     cursor^=1;return 1;
 }
 int display_frame_prompt(const char *label,const char *pin,int dialog,const char *hint) {
-    return frame(label,pin,dialog,hint,false,false);
+    return frame(label,pin,dialog,hint,false,false,false,NULL,0);
 }
 int display_terminal(const char *host_pin,const char *event,bool agent_online) {
-    return frame(NULL,host_pin,0,event,true,agent_online);
+    return frame(NULL,host_pin,0,event,true,agent_online,false,NULL,0);
+}
+int display_terminal_transfer(const char *pin,const char *event,bool online,const wb_xfer_ui *meter,uint64_t now){
+    return frame(NULL,pin,0,event,true,online,true,meter,now);
 }
 int display_frame(const char *label,const char *pin,int dialog) {
     return display_frame_prompt(label,pin,dialog,NULL);

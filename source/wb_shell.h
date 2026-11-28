@@ -5,7 +5,13 @@
 #include <stdbool.h>
 
 enum { WB_SH_PATH = WB_CMD_ARG_MAX, WB_SH_LINE = 512 };
-typedef struct { char cwd[WB_SH_PATH]; } wb_shell_engine;
+typedef struct {
+    char cwd[WB_SH_PATH];
+    char oldcwd[WB_SH_PATH];
+    bool color;
+    const char (*hist)[WB_SH_LINE];
+    unsigned hist_count, hist_cap;
+} wb_shell_engine;
 /* All filesystem calls receive canonical display paths "ux0:/...". Runtime
  * adapter still enforces mount/name, file type, privacy, byte and time policy.
  * 0 success; positive means a reported, recoverable command error;
@@ -20,9 +26,16 @@ typedef struct {
 
 void wb_shell_init(wb_shell_engine *sh);
 int wb_shell_prompt(const wb_shell_engine *sh,wb_out *out);
+/* Output strategy only, never command authorization. Uses the same tokenizer
+ * as dispatch so quoted/whitespace spellings cannot silently buffer a long App
+ * operation. The real parser and device gate still validate all operands. */
+bool wb_shell_streamed_app(const char *line);
 /* Edit only the end of one PTY input line. No dispatch, no raw listing output.
  * Successful results are bounded printable text; caller provides WB_SH_LINE. */
 bool wb_shell_complete(const wb_shell_engine *sh,const char *line,const wb_shell_ops *ops,char out[WB_SH_LINE]);
+#ifdef WB_SHELL2
+bool wb_shell_list_matches(const wb_shell_engine *sh,const char *line,const wb_shell_ops *ops,wb_out *out);
+#endif
 /* One NUL-terminated line: interactive transport rejects control bytes and
  * overlength input as a unit. Return 0 continue, 1 request closure, -1 fatal. */
 int wb_shell_run(wb_shell_engine *sh,const char *line,wb_out *out,const wb_shell_ops *ops);

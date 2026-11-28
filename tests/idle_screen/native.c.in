@@ -1,0 +1,110 @@
+#include <assert.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#include "wb_idle_screen.h"
+
+enum { SCE_TOUCH_PORT_FRONT=0,SCE_TOUCH_PORT_BACK=1,
+       SCE_KERNEL_POWER_TICK_DISABLE_AUTO_SUSPEND=1,
+       SCE_KERNEL_POWER_TICK_DISABLE_OLED_OFF=4 };
+typedef struct { unsigned buttons; unsigned char lx,ly,rx,ry; } SceCtrlData;
+typedef struct { unsigned reportNum; } SceTouchData;
+static struct {bool resilient,remote_start;} a;
+static int touch_rc[2],touch_num[2],off_rc,on_rc;
+static unsigned auto_ticks,oled_ticks,off_calls,on_calls,logs,checks;
+static char last_log[144];
+#define CHECK(x) do { assert(x); checks++; } while (0)
+static int sceTouchPeek(int port,SceTouchData *t,int n){
+    assert(port>=0 && port<2 && n==1); t->reportNum=(unsigned)touch_num[port]; return touch_rc[port];
+}
+static int sceKernelPowerTick(int flag){
+    assert(flag==SCE_KERNEL_POWER_TICK_DISABLE_AUTO_SUSPEND || flag==SCE_KERNEL_POWER_TICK_DISABLE_OLED_OFF);
+    if(flag==SCE_KERNEL_POWER_TICK_DISABLE_AUTO_SUSPEND)auto_ticks++;else oled_ticks++;
+    return 0;
+}
+static int scePowerRequestDisplayOff(void){off_calls++;return off_rc;}
+static int scePowerRequestDisplayOn(void){on_calls++;return on_rc;}
+static bool log_event(const char *s){logs++;snprintf(last_log,sizeof last_log,"%s",s);return true;}
+ACTUAL_IDLE_ADAPTER
+static bool input_accepted(bool input){
+ACTUAL_INPUT_ERROR_CHECK
+    return true;
+}
+static SceCtrlData neutral(void){return (SceCtrlData){.lx=128,.ly=128,.rx=128,.ry=128};}
+static void reset(void){
+    memset(&idle_screen,0,sizeof idle_screen);a.resilient=true;a.remote_start=false;
+    memset(touch_rc,0,sizeof touch_rc);memset(touch_num,0,sizeof touch_num);
+    off_rc=on_rc=0;auto_ticks=oled_ticks=off_calls=on_calls=logs=0;last_log[0]=0;
+}
+int main(void){
+    SceCtrlData pad=neutral();reset();
+    idle_screen_poll(0,true,&pad);idle_screen_poll(899999,true,&pad);
+    CHECK(off_calls==0 && auto_ticks==2 && oled_ticks==2);
+    idle_screen_poll(900000,true,&pad);
+    CHECK(off_calls==1 && idle_screen.off && auto_ticks==3 && oled_ticks==2);
+    CHECK(strstr(last_log,"IDLE DISPLAY OFF") && strstr(last_log,"ssh_policy=retain"));
+    idle_screen_poll(900001,false,&pad);idle_screen_poll(1800000,false,&pad);
+    CHECK(off_calls==1 && on_calls==0 && auto_ticks==5 && oled_ticks==2);
+    CHECK(input_accepted(false)); /* Native OFF permits unavailable pad samples. */
+    pad.buttons=1;idle_screen_poll(1800001,true,&pad);
+    CHECK(!idle_screen.off && on_calls==1 && oled_ticks==3);
+    CHECK(strstr(last_log,"IDLE DISPLAY ON"));
+    CHECK(!input_accepted(false)); /* No fabricated release while awake. */
+    a.remote_start=true;CHECK(input_accepted(false));
+
+    reset();pad=neutral();idle_screen_poll(0,true,&pad);
+    /* Arbitrary SSH output/session activity is not an adapter argument. */
+    for(uint64_t t=100000;t<900000;t+=100000)idle_screen_poll(t,true,&pad);
+    CHECK(idle_screen.last_activity_ms==0);
+    idle_screen_poll(900000,true,&pad);CHECK(off_calls==1);
+
+    reset();pad=neutral();idle_screen_poll(100,true,&pad);
+    pad.buttons=1;idle_screen_poll(900100,true,&pad);
+    CHECK(!off_calls && idle_screen.last_activity_ms==900100);
+    pad=neutral();idle_screen_poll(1800099,true,&pad);CHECK(!off_calls);
+    idle_screen_poll(1800100,true,&pad);CHECK(off_calls==1);
+
+    for(unsigned axis=0;axis<4;axis++){
+        reset();pad=neutral();idle_screen_poll(0,true,&pad);
+        unsigned char *v[4]={&pad.lx,&pad.ly,&pad.rx,&pad.ry};*v[axis]=axis%2?209:47;
+        idle_screen_poll(900000,true,&pad);
+        CHECK(!off_calls && idle_screen.last_activity_ms==900000);
+    }
+    reset();pad=neutral();idle_screen_poll(0,true,&pad);pad.lx=48;pad.ly=208;
+    idle_screen_poll(900000,true,&pad);CHECK(off_calls==1); /* deadzone edges */
+
+    for(int port=0;port<2;port++){
+        reset();pad=neutral();idle_screen_poll(0,true,&pad);
+        touch_rc[port]=1;touch_num[port]=1;idle_screen_poll(900000,false,&pad);
+        CHECK(!off_calls && idle_screen.last_activity_ms==900000);
+        touch_num[port]=0;idle_screen_poll(1800000,false,&pad);CHECK(off_calls==1);
+        touch_num[port]=1;idle_screen_poll(1800001,false,&pad);CHECK(on_calls==1 && !idle_screen.off);
+    }
+    reset();pad=neutral();idle_screen_poll(0,true,&pad);
+    touch_rc[0]=touch_rc[1]=-1;touch_num[0]=touch_num[1]=1;
+    idle_screen_poll(900000,false,&pad);CHECK(off_calls==1); /* failed sample not input */
+
+    reset();pad=neutral();idle_screen_poll(1000,true,&pad);idle_screen_poll(10,true,&pad);
+    CHECK(idle_screen.last_activity_ms==10 && !off_calls);
+    idle_screen_poll(900009,true,&pad);CHECK(!off_calls);
+    idle_screen_poll(900010,true,&pad);CHECK(off_calls==1);
+
+    reset();pad=neutral();idle_screen_poll(0,true,&pad);off_rc=-1;
+    idle_screen_poll(900000,true,&pad);CHECK(off_calls==1 && !idle_screen.off);
+    CHECK(!input_accepted(false));
+    for(uint64_t t=900001;t<910000;t+=16)idle_screen_poll(t,true,&pad);
+    CHECK(off_calls==1);off_rc=0;idle_screen_poll(910000,true,&pad);
+    CHECK(off_calls==2 && idle_screen.off);
+    on_rc=-1;pad.buttons=1;idle_screen_poll(910001,true,&pad);
+    CHECK(on_calls==1 && idle_screen.off);
+    pad=neutral();idle_screen_poll(920000,true,&pad);CHECK(on_calls==1);
+    on_rc=0;idle_screen_poll(920001,true,&pad);CHECK(on_calls==2 && !idle_screen.off);
+
+    reset();pad=neutral();a.resilient=false;
+    idle_screen_poll(0,true,&pad);idle_screen_poll(1800000,true,&pad);
+    CHECK(!off_calls && !auto_ticks && oled_ticks==2);
+    CHECK(!input_accepted(false));
+    printf("PASS actual idle adapter assertions=%u: controller/touch, boundary, wake, missing input, retry and independent power ticks; SDK stubs, no Vita\n",checks);
+    return 0;
+}

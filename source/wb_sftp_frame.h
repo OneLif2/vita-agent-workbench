@@ -5,7 +5,13 @@
  * pipelined requests stay in the ordinary SSH flow-control window. */
 typedef struct wb_sftp_frame {
     wb_sftp_ro engine;
-    uint8_t in[4+WB_SFTP_PACKET_MAX], out[4+WB_SFTP_REPLY_MAX];
+    uint8_t in[4+WB_SFTP_PACKET_MAX];
+#ifdef __vita__
+    uint8_t out[4+WB_SFTP_REPLY_MAX+4096];
+    size_t avail, pos;
+#else
+    uint8_t out[4+WB_SFTP_REPLY_MAX];
+#endif
     size_t got, need, sent, pending;
 } wb_sftp_frame;
 typedef int (*wb_sf_read)(void *,uint8_t *,size_t);

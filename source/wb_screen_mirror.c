@@ -1,14 +1,17 @@
 #include "wb_screen_mirror.h"
 #include "wb_panel_geometry.h"
 #include <string.h>
-struct line {char cells[WB_MIRROR_MAX_COLS+1];unsigned len;bool soft;};
+struct line {char cells[WB_MIRROR_MAX_COLS+1];uint8_t fg[WB_MIRROR_MAX_COLS];unsigned len;bool soft;};
 struct grid {struct line row[WB_MIRROR_MAX_ROWS];unsigned w,h,x,y,first,scrolled;};
 static struct grid grids[2];
 static unsigned which,utf_left,utf_val,utf_min,escape;
+static uint8_t cur_fg,cur_bold;
+static unsigned esc_p[8],esc_n,esc_val;
+static bool esc_has;
 static bool active;
 /* Only committed, rendered characters are retained. Visual rows keep their
  * original wrap width once evicted; the live viewport still reflows normally. */
-struct saved_line {uint16_t len;char cells[WB_MIRROR_MAX_COLS+1];};
+struct saved_line {uint16_t len;char cells[WB_MIRROR_MAX_COLS+1];uint8_t fg[WB_MIRROR_MAX_COLS];};
 static struct saved_line hist[WB_MIRROR_HISTORY_ROWS];
 static unsigned oldest,count,anchor,pan_col;
 static bool browsing,panned;
@@ -32,7 +35,8 @@ static void init(struct grid *g,unsigned w,unsigned h){memset(g,0,sizeof *g);g->
 static void follow(void){browsing=panned=false;anchor=pan_col=0;}
 void wb_mirror_reset(void){
     memset(grids,0,sizeof grids);memset(hist,0,sizeof hist);oldest=count=0;follow();
-    active=false;which=0;utf_left=utf_min=utf_val=escape=0;revision++;
+    active=false;which=0;utf_left=utf_min=utf_val=escape=0;
+    cur_fg=cur_bold=0;esc_n=esc_val=0;esc_has=false;revision++;
 }
 void wb_mirror_begin(void){wb_mirror_reset();init(&G,WB_MIRROR_COLS,WB_MIRROR_ROWS);active=true;}
 bool wb_mirror_active(void){return active;}
@@ -57,6 +61,13 @@ const char *wb_mirror_view_row(unsigned row,unsigned n){
     if(row>=count+G.h-top)return "";
     unsigned idx=top+row;
     return idx<count?saved(idx)->cells:wb_mirror_row(idx-count);
+}
+const uint8_t *wb_mirror_view_fg(unsigned row,unsigned n){
+    if(!active||!n||row>=n)return NULL;
+    unsigned top=view_top(n);
+    if(row>=count+G.h-top)return NULL;
+    unsigned idx=top+row;
+    return idx<count?saved(idx)->fg:(idx-count<G.h?at(&G,idx-count)->fg:NULL);
 }
 void wb_mirror_follow(void){if(browsing||panned){follow();revision++;}}
 /* Saturate any int delta, including INT_MIN, without signed negation/overflow. */
@@ -101,19 +112,22 @@ static void remember(const struct line *l){
         if(browsing&&anchor)--anchor; /* keep the same text until it too expires */
     }else ++count;
     hist[dest].len=(uint16_t)l->len;memcpy(hist[dest].cells,l->cells,l->len+1);
+    if(l->len)memcpy(hist[dest].fg,l->fg,l->len);
 }
 static void next(struct grid *g,bool soft){
     if(g->y+1<g->h)g->y++;
     else{remember(at(g,0));g->first=(g->first+1)%g->h;g->scrolled++;memset(at(g,g->y),0,sizeof(struct line));}
     at(g,g->y)->soft=soft;
 }
-static void put(struct grid *g,char c){
+static void put_fg(struct grid *g,char c,uint8_t fg){
     if(g->x>=g->w){next(g,true);g->x=0;} /* pending wrap */
     struct line *l=at(g,g->y);
-    while(l->len<g->x)l->cells[l->len++]=' ';
+    while(l->len<g->x){l->fg[l->len]=0;l->cells[l->len++]=' ';}
+    l->fg[g->x]=fg;
     l->cells[g->x++]=c;
     if(l->len<g->x){l->len=g->x;l->cells[l->len]=0;}
 }
+static void put(struct grid *g,char c){put_fg(g,c,cur_fg);}
 void wb_mirror_geometry(unsigned w,unsigned h){
     if(!active)return;
     if(!w||!h){w=WB_MIRROR_COLS;h=WB_MIRROR_ROWS;}
@@ -132,7 +146,7 @@ void wb_mirror_geometry(unsigned w,unsigned h){
         unsigned len=l->len;if(y==old->y&&len<old->x)len=old->x;
         for(unsigned x=0;x<=len;x++){
             if(y==old->y&&x==old->x){ax=to->x;ay=to->y+to->scrolled;}
-            if(x<len)put(to,x<l->len?l->cells[x]:' ');
+            if(x<len)put_fg(to,x<l->len?l->cells[x]:' ',x<l->len?l->fg[x]:0);
         }
     }
     to->y=ay>to->scrolled?ay-to->scrolled:0;
@@ -140,13 +154,43 @@ void wb_mirror_geometry(unsigned w,unsigned h){
     to->x=ax;which^=1;
     memset(old,0,sizeof *old);
 }
+static void apply_sgr(void){
+    if(esc_has || esc_n==0){if(esc_n<8)esc_p[esc_n++]=esc_val;}
+    for(unsigned i=0;i<esc_n;i++){
+        unsigned p=esc_p[i];
+        if(p==0){cur_fg=0;cur_bold=0;}
+        else if(p==1){
+            cur_bold=1;
+            if(cur_fg>=1&&cur_fg<=7)cur_fg=(uint8_t)(cur_fg+8);
+            else if(cur_fg==0)cur_fg=15;
+        }else if(p==22){
+            cur_bold=0;
+            if(cur_fg==15)cur_fg=0;
+            else if(cur_fg>=9&&cur_fg<=14)cur_fg=(uint8_t)(cur_fg-8);
+        }else if(p>=30&&p<=37){
+            unsigned base=p-30u;
+            cur_fg=(uint8_t)(base==0?8u:base+(cur_bold?8u:0u));
+        }else if(p==39){cur_fg=cur_bold?15u:0u;}
+        else if(p>=90&&p<=97){
+            unsigned base=p-90u;
+            cur_fg=(uint8_t)(base==0?8u:base+8u);
+        }
+    }
+}
 enum {ESC_NONE,ESC_INTRO,ESC_CSI,ESC_STRING,ESC_STRING_END};
 static void consume(unsigned b){
     if(escape){
         if(escape==ESC_INTRO){
-            escape=b=='['?ESC_CSI:(b==']'||b=='P'||b=='^'||b=='_')?ESC_STRING:ESC_NONE;
-        }else if(escape==ESC_CSI){if((b>=0x40&&b<=0x7e)||b<0x20)escape=ESC_NONE;}
-        else if(escape==ESC_STRING){if(b==7)escape=ESC_NONE;else if(b==27)escape=ESC_STRING_END;}
+            if(b=='['){escape=ESC_CSI;esc_n=0;esc_val=0;esc_has=false;}
+            else escape=(b==']'||b=='P'||b=='^'||b=='_')?ESC_STRING:ESC_NONE;
+        }else if(escape==ESC_CSI){
+            if(b>='0'&&b<='9'){if(esc_val<1000)esc_val=esc_val*10u+(b-'0');esc_has=true;}
+            else if(b==';'){if(esc_n<8)esc_p[esc_n++]=esc_val;esc_val=0;esc_has=true;}
+            else if((b>=0x40&&b<=0x7e)||b<0x20){
+                if(b=='m')apply_sgr();
+                escape=ESC_NONE;esc_n=0;esc_val=0;esc_has=false;
+            }
+        }else if(escape==ESC_STRING){if(b==7)escape=ESC_NONE;else if(b==27)escape=ESC_STRING_END;}
         else escape=b=='\\'||b==7?ESC_NONE:ESC_STRING;
         return;
     }

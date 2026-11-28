@@ -16,8 +16,10 @@ static struct {const char *pin,*ui_line2;uint32_t power_calls;} a={"public-devic
 static wb_r1_notice r1_notice;
 static bool local_released,has_focus=true;
 static unsigned prompted;
-static bool foreground(bool capture){assert(!capture);return has_focus;}
-static void review_return_expected(const char *receipt){assert(!strcmp(receipt,"fixture-ready"));prompted++;}
+/* 02.18 removed the R1 owner prompt from the frame loop; these stay only to
+ * prove the loop no longer reaches them. */
+__attribute__((unused)) static bool foreground(bool capture){assert(!capture);return has_focus;}
+__attribute__((unused)) static void review_return_expected(const char *receipt){assert(!strcmp(receipt,"fixture-ready"));prompted++;}
 static unsigned ui_seen, online_notes,idle_notes,login_notes;
 static char last;
 static int connected,ok_to_draw=1,can_bind=1,sig=SSH_PUBLICKEY_STATE_VALID,ack=SSH_OK;
@@ -110,11 +112,8 @@ int main(void){
     peer();assert(auth());wb_ssh_end_session(&g_ssh);expect("short login before next frame",'I');
     peer();assert(auth());local_released=true;
     r1_notice=(wb_r1_notice){.receipt="fixture-ready",.sent_ms=now_ms(),.power_gen=a.power_calls,.pending=true};
-    expect("live channel defers owner prompt",'T');assert(!prompted&&local_released);
-    wb_ssh_end_session(&g_ssh);expect("channel close posts owner prompt",'I');assert(prompted==1&&!local_released);
-    expect("idle frame never replays prompt",'I');assert(prompted==1);
-    r1_notice=(wb_r1_notice){.receipt="fixture-ready",.sent_ms=now_ms(),.power_gen=a.power_calls,.pending=true};
-    has_focus=false;expect("background cancels owner prompt",'I');assert(prompted==1&&!r1_notice.pending);has_focus=true;
-    puts("PASS: first ready frame uses terminal; failed auth cannot set ONLINE, auth/disconnect never change panels");
+    expect("live channel: no owner prompt",'T');assert(!prompted&&local_released);
+    wb_ssh_end_session(&g_ssh);expect("channel close: still no owner prompt",'I');assert(!prompted&&local_released);
+    puts("PASS: first ready frame uses terminal; failed auth cannot set ONLINE; 02.18 frame loop never shows an R1 prompt");
     return 0;
 }

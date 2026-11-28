@@ -7,8 +7,8 @@
  * VPK install path plus an in-process payload swap so the owner's SSH
  * connection survives the update. */
 
-#define WB_VERSION      "02.06"
-#define WB_BUILD_TAG    WB_VERSION "-live-safequery"
+#define WB_VERSION      "02.21"
+#define WB_BUILD_TAG    WB_VERSION "-hyper-sftp"
 #define WB_PAYLOAD_ABI  3u
 #define WB_PROTO        "wb10"
 

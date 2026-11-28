@@ -13,9 +13,40 @@
 static int say(wb_out *out,const char *s){return wb_out_puts(out,s)<0?-1:0;}
 static int done(int rc){return rc<0?-1:0;}
 static int eq(const char *a,const char *b){return !strcmp(a,b);}
-void wb_shell_init(wb_shell_engine *s){if(s)memcpy(s->cwd,ROOT,sizeof ROOT);}
+void wb_shell_init(wb_shell_engine *s){
+    if(!s)return;
+    memset(s,0,sizeof *s);
+    memcpy(s->cwd,ROOT,sizeof ROOT);
+    memcpy(s->oldcwd,ROOT,sizeof ROOT);
+}
+#ifdef WB_SHELL2
+static void unix_prompt_path(const char *cwd,char dst[WB_SH_PATH+8]){
+    if(!strcmp(cwd,"/")){strcpy(dst,"/");return;}
+    const char *colon=strchr(cwd,':');
+    if(colon && colon[1]=='/'){
+        const size_t mlen=(size_t)(colon-cwd);
+        const char *rest=colon+2;
+        dst[0]='/';
+        memcpy(dst+1,cwd,mlen);
+        size_t w=1+mlen;
+        if(*rest){dst[w++]='/';size_t rl=strlen(rest);if(w+rl>=WB_SH_PATH+7)rl=WB_SH_PATH+6-w;memcpy(dst+w,rest,rl);w+=rl;}
+        dst[w]=0;
+        return;
+    }
+    size_t n=strlen(cwd);if(n>=WB_SH_PATH+7)n=WB_SH_PATH+7;
+    memcpy(dst,cwd,n);dst[n]=0;
+}
+#endif
 int wb_shell_prompt(const wb_shell_engine *s,wb_out *out){
-    return !s || wb_out_printf(out,"%s> ",s->cwd)<0 ? -1 : 0;
+    if(!s)return -1;
+#ifdef WB_SHELL2
+    char disp[WB_SH_PATH+8];
+    unix_prompt_path(s->cwd,disp);
+    if(s->color)return wb_out_printf(out,"\033[1;32mpi@vita\033[0m:\033[1;34m%s\033[0m$ ",disp)<0?-1:0;
+    return wb_out_printf(out,"pi@vita:%s$ ",disp)<0?-1:0;
+#else
+    return wb_out_printf(out,"%s> ",s->cwd)<0 ? -1 : 0;
+#endif
 }
 
 /* Split spaces and quotes only. Tabs may delimit arguments, never become
@@ -45,29 +76,98 @@ static int split(const char *line,char buf[WB_SH_LINE+1],char *v[NWORDS]){
     return quote?-1:count;
 }
 
+#ifdef WB_SHELL2
+static bool has_operator(const char *line){
+    char q=0;
+    for(size_t i=0;i<WB_SH_LINE && line[i];i++){
+        const char c=line[i];
+        if(q){if(c==q)q=0;continue;}
+        if(c=='\''||c=='"'){q=c;continue;}
+        if(c==';'||c=='|'||c=='&')return true;
+    }
+    return false;
+}
+#endif
+bool wb_shell_streamed_app(const char *line){
+    if(!line)return false;
+#ifdef WB_SHELL2
+    if(has_operator(line))return true; /* compound output is drained as it is produced */
+#endif
+    char buf[WB_SH_LINE+1],*v[NWORDS];const int n=split(line,buf,v);
+    if(n<1)return false;
+    return (n==2 && eq(v[0],"app-install")) ||
+           (n==3 && eq(v[0],"app") && eq(v[1],"install")) ||
+           ((n==3 || n==4) && eq(v[0],"app") && eq(v[1],"plan")) ||
+           ((n==6 || n==8) && eq(v[0],"app") && eq(v[1],"patch")) ||
+           (n>=2 && eq(v[0],"app") && (eq(v[1],"list-installed")||eq(v[1],"ls")||
+                                       eq(v[1],"install-vpk")||eq(v[1],"patch-eboot"))) ||
+           eq(v[0],"ll") || (n>=2 && eq(v[0],"ls") && eq(v[1],"-lh")) ||
+           eq(v[0],"sha256sum") || eq(v[0],"head") || eq(v[0],"tail") ||
+           eq(v[0],"cp") || eq(v[0],"du") || eq(v[0],"grep") || eq(v[0],"find") ||
+           eq(v[0],"hexdump") || eq(v[0],"xxd");
+}
+
+#ifdef WB_SHELL2
+/* Workbench 2.0 mounts: ur0:/ uma0:/ and Linux-style /ux0 /ur0 /uma0 aliases. */
+static int mount_alias(const char **pp,char out[WB_SH_PATH],size_t *mount){
+    static const char *const in[]={"ur0:/","uma0:/","/ux0","/ur0","/uma0"};
+    static const char *const nat[]={"ur0:/","uma0:/","ux0:/","ur0:/","uma0:/"};
+    for(size_t i=0;i<sizeof in/sizeof *in;i++){
+        const size_t k=strlen(in[i]);
+        if(strncmp(*pp,in[i],k))continue;
+        if(in[i][k-1]!='/' && (*pp)[k] && (*pp)[k]!='/')continue;
+        *pp+=k;if(**pp=='/')++*pp;
+        memcpy(out,nat[i],strlen(nat[i])+1);*mount=strlen(nat[i]);
+        return 1;
+    }
+    return 0;
+}
+#endif
+static size_t cwd_mount(const char *cwd){return strncmp(cwd,"uma0:/",6)?5u:6u;}
 static int resolve(const char *cwd,const char *input,char out[WB_SH_PATH]){
     if(!input || !*input)return 0;
     const char *p=input;
     /* Only the literal absolute /inbox component selects this shorthand.
      * Keep a physical cwd and use the usual bounds, type, and policy checks.
      * An explicitly alias-qualified path must not walk above its anchor. */
-    size_t floor=sizeof ROOT-1;
+    size_t floor=sizeof ROOT-1,mount=sizeof ROOT-1;
+#ifdef WB_SHELL2
+    if(eq(p,"/")){strcpy(out,"/");return 1;}
+    if(!strcmp(cwd,"/") && p[0]!='/' && !strchr(p,':')){
+        if(eq(p,".")||eq(p,"..")){strcpy(out,"/");return 1;}
+        char tmp[WB_SH_PATH];
+        if(strlen(p)+2>=sizeof tmp)return 0;
+        tmp[0]='/';strcpy(tmp+1,p);
+        return resolve(ROOT,tmp,out);
+    }
+    if(p[0]=='~' && (!p[1] || p[1]=='/')){
+        p+=1;if(*p=='/')++p;
+        memcpy(out,INBOX_DIR,sizeof INBOX_DIR);floor=sizeof INBOX_DIR-1;
+    }else
+#endif
     if(!strncmp(p,"/inbox",6) && (!p[6] || p[6]=='/')){
         p+=6;if(*p=='/')++p;
         memcpy(out,INBOX_DIR,sizeof INBOX_DIR);floor=sizeof INBOX_DIR-1;
-    }else if(!strncmp(p,ROOT,sizeof ROOT-1)){p+=sizeof ROOT-1;memcpy(out,ROOT,sizeof ROOT);}
+    }
+#ifdef WB_SHELL2
+    else if(mount_alias(&p,out,&mount))floor=mount;
+#endif
+    else if(!strncmp(p,ROOT,sizeof ROOT-1)){p+=sizeof ROOT-1;memcpy(out,ROOT,sizeof ROOT);}
     else if(*p=='/'){++p;memcpy(out,ROOT,sizeof ROOT);}
     else if(!strncmp(p,"ux0:data",8) && (!p[8]||p[8]=='/')){
         /* Explicit legacy spelling used by the existing WB core. */
         p+=4;memcpy(out,ROOT,sizeof ROOT);
-    }else memcpy(out,cwd,strlen(cwd)+1);
+    }else{memcpy(out,cwd,strlen(cwd)+1);floor=mount=cwd_mount(cwd);}
     size_t w=strlen(out);
     while(*p){
         const char *end=strchr(p,'/');size_t len=end?(size_t)(end-p):strlen(p);
         if(!len || len>100)return 0;
         if(len==1 && *p=='.'){} /* current */
         else if(len==2 && p[0]=='.' && p[1]=='.'){
-            if(w==floor && floor!=sizeof ROOT-1)return 0;
+#ifdef WB_SHELL2
+            if(w==mount && floor==mount && !end){strcpy(out,"/");return 1;}
+#endif
+            if(w==floor && floor!=mount)return 0;
             while(w>floor && out[w-1]!='/')--w;
             if(w>floor)--w;
             out[w]=0;
@@ -75,8 +175,8 @@ static int resolve(const char *cwd,const char *input,char out[WB_SH_PATH]){
             for(size_t j=0;j<len;j++)
                 if((unsigned char)p[j]<32 || (unsigned char)p[j]>=127 || strchr(":\\\"*?<>|",p[j]))return 0;
             if(p[len-1]=='.'||p[len-1]==' ')return 0;
-            if(w+(w>sizeof ROOT-1?1u:0u)+len>=WB_SH_PATH)return 0;
-            if(w>sizeof ROOT-1)out[w++]='/';
+            if(w+(w>mount?1u:0u)+len>=WB_SH_PATH)return 0;
+            if(w>mount)out[w++]='/';
             memcpy(out+w,p,len);w+=len;out[w]=0;
         }
         if(!end)break;
@@ -123,16 +223,16 @@ static int match_rows(void *ctx,const char *p,size_t n){
 static int discard_row(void *ctx,const char *p,size_t n){(void)ctx;(void)p;(void)n;return 0;}
 bool wb_shell_complete(const wb_shell_engine *s,const char *line,const wb_shell_ops *ops,char out[WB_SH_LINE]){
     static const char *const commands[]={
-        "app","app-approve","app-install","apply-core","apply-return","bye","cat","cd","close","deploy","df","diag","doctor","exit","ext",
-        "font","get","hash-selftest","help","inspect","install","launch","ls","mkdir","mv","pending","photo-export",
+        "app","app-approve","app-install","apply-core","apply-return","bye","cat","cd","clear","close","cp","deploy","df","diag","doctor","du","echo","exit","ext",
+        "find","font","free","get","grep","hash-selftest","head","help","hexdump","history","hostname","inspect","install","launch","ll","ls","mkdir","mv","pending","photo-export",
         "plan","promote","ps","put","pwd","quit","r1-auto-status","r1-notice","r1-review","r1-signed","r1-status","reload","rm","rollback","s1-check","send",
-        "settings","shot","stat","status","test","timeline","update","updater","ver","wake","wb","wb-status",
+        "settings","sha256sum","shot","stat","status","tail","test","timeline","touch","uname","update","updater","uptime","ver","wake","wb","wb-status","whoami","xxd",
 #ifdef WB_GAME_FEATURE
         "python3",
 #endif
     };
-    static const char *const paths[]={"ls","cd","cat","stat","inspect","plan","app-install","install",
-        "deploy","photo-export","rm","mv","mkdir","get"};
+    static const char *const paths[]={"ls","ll","cd","cat","head","tail","sha256sum","cp","touch","du","stat","inspect","plan","app-install","install",
+        "deploy","photo-export","rm","mv","mkdir","get","find","hexdump","xxd"};
     if(!s||!line||!ops||!out)return false;
     size_t size=0,beg=0;char quote=0;
     while(size<WB_SH_LINE && line[size]){
@@ -164,12 +264,14 @@ bool wb_shell_complete(const wb_shell_engine *s,const char *line,const wb_shell_
         if(game)return false;
 #endif
         int operand=1;
-        if(eq(cmd,"ls")&&argc>2&&eq(words[1],"-l"))++operand;
+        if(eq(cmd,"ls")&&argc>2&&(eq(words[1],"-l")||eq(words[1],"-lh")))++operand;
+        if(eq(cmd,"du")&&argc>2&&eq(words[1],"-h"))++operand;
+        if((eq(cmd,"head")||eq(cmd,"tail"))&&argc>3&&eq(words[1],"-n"))operand+=2;
         if(operand<argc-1 && eq(words[operand],"--") && (eq(cmd,"cd")||eq(cmd,"ls")||eq(cmd,"cat")))++operand;
         if((eq(cmd,"app")&&(eq(words[1],"plan")||eq(words[1],"install")))||
            (eq(cmd,"update")&&(eq(words[1],"plan")||eq(words[1],"stage"))))++operand;
         else if(!game&&!oneof(cmd,paths,sizeof paths/sizeof *paths))return false;
-        if(argc-1!=operand&&!(eq(cmd,"mv")&&argc==3))return false;
+        if(argc-1!=operand&&!((eq(cmd,"mv")||eq(cmd,"cp"))&&argc==3)&&!(eq(cmd,"sha256sum")&&argc>=2))return false;
         if(game&&(argc!=2||quote||strcmp(s->cwd,INBOX_DIR)||strchr(token,'/')))return false;
         const char *slash=strrchr(token,'/');char dir[WB_SH_PATH],canonical[WB_SH_PATH];
         dirlen=slash?(size_t)(slash+1-token):0;
@@ -197,6 +299,76 @@ bool wb_shell_complete(const wb_shell_engine *s,const char *line,const wb_shell_
     if(argc==1&&m.hits==1)out[w++]=' ';
     out[w]=0;return strcmp(line,out)!=0;
 }
+#ifdef WB_SHELL2
+typedef struct {
+    const char *leaf; int dirs; unsigned shown; wb_out *out; size_t used; char row[104];
+} list_ctx;
+static int list_rows(void *ctx,const char *p,size_t n){
+    list_ctx *lc=ctx;
+    for(size_t i=0;i<n;i++){
+        unsigned char ch=(unsigned char)p[i];
+        if(ch!='\n'){if(lc->used<sizeof lc->row-1 && ch>=32 && ch<127)lc->row[lc->used++]=(char)ch;continue;}
+        lc->row[lc->used]=0;
+        if(lc->used && !strncmp(lc->row,lc->leaf,strlen(lc->leaf)) && (!lc->dirs || lc->row[lc->used-1]=='/')){
+            if(lc->shown<40){
+                if(lc->shown && wb_out_puts(lc->out,"  ")<0)return -1;
+                if(wb_out_puts(lc->out,lc->row)<0)return -1;
+            }
+            lc->shown++;
+        }
+        lc->used=0;
+    }
+    return 0;
+}
+bool wb_shell_list_matches(const wb_shell_engine *s,const char *line,const wb_shell_ops *ops,wb_out *out){
+    static const char *const commands[]={
+        "app","bye","cat","cd","clear","cp","df","diag","doctor","du","echo","exit","ext",
+        "find","font","free","get","grep","head","help","hexdump","history","hostname","inspect",
+        "install","launch","ll","ls","mkdir","mv","pending","plan","ps","put","pwd","quit",
+        "reload","rm","rollback","settings","sha256sum","shot","stat","status","tail","test",
+        "timeline","touch","uname","update","updater","uptime","ver","wb","whoami","xxd"
+    };
+    if(!s||!line||!ops||!out)return false;
+    size_t size=strlen(line),beg=0;
+    for(size_t i=0;i<size;i++)if(line[i]==' ')beg=i+1;
+    const char *token=line+beg;
+    char scratch[WB_SH_LINE+1],parsed[WB_SH_LINE+1],*words[NWORDS];
+    if(size>=WB_SH_LINE)return false;
+    memcpy(scratch,line,size+1);
+    int argc=split(scratch,parsed,words);
+    if(argc<1)return false;
+    if(argc==1 && *token){
+        unsigned shown=0;
+        for(size_t i=0;i<sizeof commands/sizeof *commands;i++){
+            if(!strncmp(commands[i],token,strlen(token))){
+                if(shown) (void)wb_out_puts(out,"  ");
+                (void)wb_out_puts(out,commands[i]);
+                shown++;
+            }
+        }
+        if(shown>1){(void)wb_out_puts(out,"\n");return true;}
+        return false;
+    }
+    if(argc>=2 && ops->list && ops->isdir){
+        const char *slash=strrchr(token,'/');
+        size_t dirlen=slash?(size_t)(slash+1-token):0;
+        char dir[WB_SH_PATH],canonical[WB_SH_PATH];
+        if(dirlen>=sizeof dir)return false;
+        if(dirlen){memcpy(dir,token,dirlen);dir[dirlen]=0;}else strcpy(dir,".");
+        if(!resolve(s->cwd,dir,canonical) || eq(canonical,"/"))return false;
+        wb_out quiet={NULL,discard_row};
+        list_ctx lc={token+dirlen,eq(words[0],"cd"),0,out,0,{0}};
+        wb_out sink={&lc,list_rows};
+        if(ops->isdir(ops->ctx,canonical,&quiet)!=0 || ops->list(ops->ctx,canonical,false,&sink)!=0)return false;
+        if(lc.shown>1){
+            if(lc.shown>40)(void)wb_out_printf(out,"  ... (%u total)",lc.shown);
+            (void)wb_out_puts(out,"\n");
+            return true;
+        }
+    }
+    return false;
+}
+#endif
 
 /* Encode quoted spaces for the existing fixed-operand parser so "a b" does
  * not become two arguments or a new option. 0x1f cannot come from split(). */
@@ -266,6 +438,14 @@ static int core_raw(const wb_shell_ops *ops,const wb_cmd *c,wb_out *out){
 #include "wb_shell_settings.inc"
 
 static const char *topic_help(const char *t){
+    if(eq(t,"linux"))return
+        "ll [PATH] | ls -lh [PATH] : streamed human-readable listing\n"
+        "head|tail [-n N] FILE | grep [-ivnc] PATTERN FILE... | find [PATH] [-name GLOB] [-type f|d]\n"
+        "hexdump|xxd [-n N] FILE | sha256sum FILE... | du [-h] [PATH] | echo TEXT | history | clear\n"
+        "Chain: CMD ; CMD | CMD && CMD   Pipe filters: grep [-ivc] PAT | head/tail [-n N] | wc [-l|-w|-c] | sort [-r] | uniq\n"
+        "Mounts: /ux0 /ur0 /uma0 (read-only browse), /inbox = ux0:/VITA-POC (writable: cp touch mkdir mv rm)\n"
+        "Keys: Up/Down history, Left/Right/Home/End edit, Ctrl-A/E/K/W/L/U/C, Tab completes.\n"
+        "uname [-a] | whoami | hostname | uptime | free [-h] : device & memory info\n";
     if(eq(t,"diag"))return "diag crashes [--limit N] (1..32, default 10): latest ux0:data psp2core file metadata only. Times are device-local. No dump is opened.\n";
     if(eq(t,"settings"))return WB_SETTINGS_HELP;
     if(eq(t,"font"))return
@@ -282,11 +462,9 @@ static const char *topic_help(const char *t){
         "put ABS BYTES sha256=HEX (send is an alias); get ABS. Use the 5090 framed terminal sender/receiver for PC files.\n"
         "After a verified upload: photo-export IMAGE SHA256 to import once into Photos. Do not retry an uncertain receipt.\n";
     if(eq(t,"update"))return
-        "update plan VPK | update stage VPK sha256=HEX | update apply | pending | s1-check\n"
-        "update stage queues verified content without applying the queued core. update apply is the attended updater; SSH will drop.\n"
-        "Owner-approved return: r1-review (read only) | r1-status | apply-return NONCE.\n"
-        "r1-auto-status shows locally enrolled signed-update consent; r1-signed R S requires it. Only local SELECT revokes standing consent.\n"
-        "r1-notice MANIFEST posts the verified update for the owner's local approval after disconnect; it does not authorize or apply.\n"
+        "Zero-button update (Workbench 2.0): update plan VPK | update stage VPK sha256=HEX | update apply | pending | s1-check\n"
+        "update stage verifies WBQ2 (title, version, SHA-256); update apply launches INAP00019, which promotes and relaunches WB. SSH reconnects.\n"
+        "R1 owner prompts were removed in 02.18; r1-status reports mode=agent-ops.\n"
         "updater check: read-only identity and registration check of INAP00019 (no promotion or launch).\n"
         "Payload: deploy SUPRX (approved payload bytes only) | reload | rollback. No --force.\n";
     if(eq(t,"ps"))return "ps | app running: read-only bounded AppMgr-started-app snapshot; foreground remains unknown.\n";
@@ -295,6 +473,9 @@ static const char *topic_help(const char *t){
         "Probe data is NOT authenticated receiver readiness. close wb remains disabled until a real receiver is verified.\n";
     if(eq(t,"app"))return
         "app list | app running (alias: ps) | app plan VPK [CASE] | app install VPK | launch TITLE CASE JOB\n"
+        "Agent: app ls | app install-vpk INCOMING.vpk | app patch-eboot TITLE INCOMING.bin [--ver XX.YY] | app launch TITLE | app remove TITLE | app prune [TITLE]\n"
+        "(agent commands refuse INAP00018, INAP00019, NPXS* and vs0 system titles; patch-eboot keeps a backup and verifies SHA-256)\n"
+        "app patch plan RJGM52237 01.16 INCOMING.bin | app patch apply RJGM52237 01.16 INCOMING.bin R S (owner signature)\n"
         "app status TITLE | app uninstall-plan TITLE | app uninstall TITLE TOKEN (same terminal, 120s)\n"
         "app status VSSH00001 | app uninstall VSSH00001 (only approved ssh-vita 1.4.2)\n"
         "list shows approvals, not installed apps. plan checks actual stored bytes without staging. install never launches.\n";
@@ -302,14 +483,14 @@ static const char *topic_help(const char *t){
         "test run CASE JOB | test result CASE JOB. Make JOB unique; reconnect after launch and check ver/run.\n"
         "result checks job, title, registered case/build and assertion; a launch reply alone is never PASS.\n";
     if(eq(t,"status"))return
-        "doctor | ver | status | pending | timeline [selftest] | df [required-bytes] | hash-selftest | inspect FILE | shot\n"
+        "doctor | ver | status | pending | timeline [selftest] | df [required-bytes] | df -h (ux0: capacity) | hash-selftest | inspect FILE | shot\n"
         "wb status (wb-status) is a paired terminal diagnostic of live focus, link, queue and standing state. Lock state unavailable.\n"
         "close wb requires a verified WAKE receiver (unavailable in this version). exit only closes this SSH shell.\n"
         "Payload: ext hello/sys/features/tick/ls/stat/mkdir/mv/rm. Terminal rejects unknown verbs/flags.\n";
-    return "ERR help topic: files transfer update app test status font settings diag\n";
+    return "ERR help topic: files linux transfer update app test status font settings diag\n";
 }
 
-int wb_shell_run(wb_shell_engine *s,const char *line,wb_out *out,const wb_shell_ops *ops){
+static int wb_shell_run_one(wb_shell_engine *s,const char *line,wb_out *out,const wb_shell_ops *ops){
     if(!s||!line||!out||!out->write||!ops)return -1;
     size_t count=0;while(count<=WB_SH_LINE && line[count])count++;
     if(count>WB_SH_LINE)return say(out,"ERR command too long\n");
@@ -321,36 +502,207 @@ int wb_shell_run(wb_shell_engine *s,const char *line,wb_out *out,const wb_shell_
     if(n<0)return say(out,"ERR syntax: use one bounded ASCII command; no pipes, redirects or expansions\n");
     if(!n)return 0;
     const char *verb=v[0];
+    if(eq(verb,"df") && n>=2 && eq(v[1],"-h")){
+        if(n!=2)return say(out,"ERR usage: df -h (ux0: only)\n");
+        wb_cmd c={0};c.kind=WB_CMD_TERM_DF_HUMAN;return done(core_raw(ops,&c,out));
+    }
     if(eq(verb,"exit")||eq(verb,"quit")||eq(verb,"bye")){
         if(n!=1)return say(out,"ERR usage: exit\n");
         return say(out,"Bye.\n")<0?-1:1;
     }
     if(eq(verb,"help")||eq(verb,"?")){
         if(n==2)return say(out,topic_help(v[1]));
-        if(n!=1)return say(out,"ERR usage: help [files|transfer|update|app|ps|wake|test|status|font|settings|diag]\n");
+        if(n!=1)return say(out,"ERR usage: help [files|linux|transfer|update|app|ps|wake|test|status|font|settings|diag]\n");
         return say(out,
-            "pwd | cd [DIR] | ls [-l] [PATH] | cat FILE | ps | app running | exit\n"
+            "pwd | cd [DIR] | ls [-l|-lh] [PATH] | ll [PATH] | cat/head/tail FILE | sha256sum | clear | ps | exit\n"
 #ifdef WB_GAME_FEATURE
             "Game: cd VITA-POC, then python3 tictactoe_ai.py (trusted file only). Game exit closes this channel.\n"
 #endif
             "Paths use ux0:/ or /; try cd /inbox. Tab completes commands and approved paths; Enter runs. No OS shell.\n"
-            "doctor | help files | help transfer | help update | help app | help test | help status | help font | help settings | help diag\n"
+            "doctor | help files | help linux | help transfer | help update | help app | help test | help status | help font | help settings | help diag\n"
             "Workbench commands include ver status df timeline pending inspect plan shot photo-export\n"
             "app-install launch install apply-core apply-return r1-notice r1-review r1-status promote reload rollback deploy\n");
     }
     if(eq(verb,"settings"))return wbsh_settings(ops,n,v,out);
     if(eq(verb,"pwd"))return n==1?done(wb_out_printf(out,"%s\n",s->cwd)):say(out,"ERR usage: pwd\n");
+    if(eq(verb,"clear"))return say(out,n==1?"ERR clear requires interactive PTY\n":"ERR usage: clear\n");
+#ifdef WB_SHELL2
+    if(eq(verb,"history")){
+        if(n>2)return say(out,"ERR usage: history [N]\n");
+        unsigned cap=s->hist_cap;
+        if(!s->hist || !cap || !s->hist_count)return 0;
+        unsigned avail=s->hist_count<cap?s->hist_count:cap;
+        unsigned want=avail;
+        if(n==2){
+            const size_t z=strlen(v[1]);
+            if(!z||z>4||strspn(v[1],"0123456789")!=z)return say(out,"ERR usage: history [N]\n");
+            unsigned num=0;for(size_t i=0;i<z;i++)num=num*10u+(unsigned)(v[1][i]-'0');
+            if(num<want)want=num;
+        }
+        const unsigned first=s->hist_count-want;
+        for(unsigned i=0;i<want;i++){
+            if(wb_out_printf(out,"%4u  %s\n",first+i+1,s->hist[(first+i)%cap])<0)return -1;
+        }
+        return 0;
+    }
+#endif
+    if(eq(verb,"echo")){
+        for(int i=1;i<n;i++){
+            if(i>1 && say(out," "))return -1;
+            if(say(out,v[i]))return -1;
+        }
+        return say(out,"\n");
+    }
+    if(eq(verb,"grep")){
+        /* grep [-ivnc] PATTERN FILE... (pipeline filter form is handled before this) */
+        int i=1;wb_cmd lc={0};lc.kind=WB_CMD_TERM_LINUX;strcpy(lc.name,"grep");
+        lc.argv[0][0]=0;
+        while(i<n && v[i][0]=='-' && v[i][1]){
+            const size_t fl=strlen(v[i]+1);
+            if(strspn(v[i]+1,"ivnc")!=fl || strlen(lc.argv[0])+fl>=8)return say(out,"ERR usage: grep [-ivnc] PATTERN FILE...\n");
+            strcat(lc.argv[0],v[i]+1);i++;
+        }
+        if(n-i<2 || n-i-1>WB_CMD_MAX_ARGS-2 || !v[i][0] || strlen(v[i])>=WB_CMD_ARG_MAX)
+            return say(out,"ERR usage: grep [-ivnc] PATTERN FILE... (max 4 files)\n");
+        strcpy(lc.argv[1],v[i++]);lc.argc=2;
+        for(;i<n;i++)if(!resolve(s->cwd,v[i],lc.argv[lc.argc++]))return say(out,"ERR invalid ux0 path\n");
+        return done(core_raw(ops,&lc,out));
+    }
+    if(eq(verb,"find")){
+        int i=1;wb_cmd lc={0};lc.kind=WB_CMD_TERM_LINUX;strcpy(lc.name,"find");lc.argc=3;
+        const char *start=".";strcpy(lc.argv[1],"*");strcpy(lc.argv[2],"a");
+        if(i<n && v[i][0]!='-')start=v[i++];
+        while(i<n){
+            if(eq(v[i],"-name") && i+1<n && strlen(v[i+1])<WB_CMD_ARG_MAX){strcpy(lc.argv[1],v[i+1]);i+=2;}
+            else if(eq(v[i],"-type") && i+1<n && (eq(v[i+1],"f")||eq(v[i+1],"d"))){strcpy(lc.argv[2],v[i+1]);i+=2;}
+            else return say(out,"ERR usage: find [PATH] [-name GLOB] [-type f|d]\n");
+        }
+        if(!resolve(s->cwd,start,lc.argv[0]))return say(out,"ERR invalid ux0 path\n");
+        return done(core_raw(ops,&lc,out));
+    }
+    if(eq(verb,"hexdump")||eq(verb,"xxd")){
+        int i=1;const char *count="256";
+        if(i<n && eq(v[i],"-n")){
+            if(i+2>=n)return say(out,"ERR usage: hexdump [-n N] FILE (N=1..4096)\n");
+            count=v[i+1];i+=2;
+            const size_t z=strlen(count);
+            if(!z||z>4||strspn(count,"0123456789")!=z)return say(out,"ERR byte count must be 1..4096\n");
+        }
+        if(n-i!=1)return say(out,"ERR usage: hexdump [-n N] FILE (N=1..4096)\n");
+        wb_cmd lc={0};lc.kind=WB_CMD_TERM_LINUX;strcpy(lc.name,"hexdump");lc.argc=2;
+        if(!resolve(s->cwd,v[i],lc.argv[0]))return say(out,"ERR invalid ux0 path\n");
+        strcpy(lc.argv[1],count);
+        return done(core_raw(ops,&lc,out));
+    }
+    if(eq(verb,"ll") || (eq(verb,"ls") && n>=2 && eq(v[1],"-lh"))){
+        int i=eq(verb,"ll")?1:2;
+        if(n-i>1 || (i<n && v[i][0]=='-'))return say(out,"ERR usage: ll [PATH] | ls -lh [PATH]\n");
+        wb_cmd lc={0};lc.kind=WB_CMD_TERM_LINUX;strcpy(lc.name,"ll");lc.argc=1;
+        if(!resolve(s->cwd,i<n?v[i]:".",lc.argv[0]))return say(out,"ERR invalid ux0 path\n");
+#ifdef WB_SHELL2
+        if(eq(lc.argv[0],"/"))return say(out,
+            "drwxr-xr-x        - virtual          ux0/\n"
+            "dr-xr-xr-x        - virtual          ur0/\n"
+            "dr-xr-xr-x        - virtual          uma0/\n"
+            "drwxr-xr-x        - alias->ux0:/VITA-POC inbox/\n"
+            "total 0 files, 4 dirs, 0B (0 B)\n");
+#endif
+        return done(core_raw(ops,&lc,out));
+    }
+    if(eq(verb,"sha256sum")){
+        if(n<2 || n-1>WB_CMD_MAX_ARGS)return say(out,"ERR usage: sha256sum FILE [FILE...]\n");
+        wb_cmd lc={0};lc.kind=WB_CMD_TERM_LINUX;strcpy(lc.name,"sha256sum");lc.argc=n-1;
+        for(int i=1;i<n;i++){
+            if(v[i][0]=='-' || !resolve(s->cwd,v[i],lc.argv[i-1]))return say(out,"ERR invalid ux0 path\n");
+        }
+        return done(core_raw(ops,&lc,out));
+    }
+    if(eq(verb,"head")||eq(verb,"tail")){
+        int i=1;const char *lines="20";
+        if(i<n && eq(v[i],"-n")){
+            if(i+2>=n)return say(out,"ERR usage: head|tail [-n N] FILE (N=1..200)\n");
+            lines=v[i+1];size_t lz=strlen(lines);
+            if(!lz||lz>3||strspn(lines,"0123456789")!=lz)return say(out,"ERR line count must be 1..200\n");
+            unsigned lv=0;for(size_t k=0;k<lz;k++)lv=lv*10u+(unsigned)(lines[k]-'0');
+            if(lv<1||lv>200)return say(out,"ERR line count must be 1..200\n");
+            i+=2;
+        }
+        if(n-i!=1 || v[i][0]=='-')return say(out,"ERR usage: head|tail [-n N] FILE (N=1..200)\n");
+        wb_cmd lc={0};lc.kind=WB_CMD_TERM_LINUX;strcpy(lc.name,verb);lc.argc=2;
+        if(!resolve(s->cwd,v[i],lc.argv[0]))return say(out,"ERR invalid ux0 path\n");
+        strcpy(lc.argv[1],lines);
+        return done(core_raw(ops,&lc,out));
+    }
+    if(eq(verb,"cp")){
+        if(n!=3 || v[1][0]=='-' || v[2][0]=='-')return say(out,"ERR usage: cp SRC DST\n");
+        wb_cmd lc={0};lc.kind=WB_CMD_TERM_LINUX;strcpy(lc.name,"cp");lc.argc=2;
+        if(!resolve(s->cwd,v[1],lc.argv[0]) || !resolve(s->cwd,v[2],lc.argv[1]))
+            return say(out,"ERR invalid ux0 path\n");
+        if(strncmp(lc.argv[0],INCOMING,sizeof INCOMING-1) || !lc.argv[0][sizeof INCOMING-1] ||
+           (strncmp(lc.argv[1],INCOMING,sizeof INCOMING-1) && !eq(lc.argv[1],INBOX_DIR)))
+            return say(out,"ERR path denied\n");
+        return done(core_raw(ops,&lc,out));
+    }
+    if(eq(verb,"touch")){
+        if(n!=2 || v[1][0]=='-')return say(out,"ERR usage: touch FILE\n");
+        wb_cmd lc={0};lc.kind=WB_CMD_TERM_LINUX;strcpy(lc.name,"touch");lc.argc=1;
+        if(!resolve(s->cwd,v[1],lc.argv[0]))return say(out,"ERR invalid ux0 path\n");
+        if(strncmp(lc.argv[0],INCOMING,sizeof INCOMING-1) || !lc.argv[0][sizeof INCOMING-1])
+            return say(out,"ERR path denied\n");
+        return done(core_raw(ops,&lc,out));
+    }
+    if(eq(verb,"du")){
+        int i=1;bool human=false;
+        if(i<n && eq(v[i],"-h")){human=true;i++;}
+        if(n-i>1 || (i<n && v[i][0]=='-'))return say(out,"ERR usage: du [-h] [PATH]\n");
+        wb_cmd lc={0};lc.kind=WB_CMD_TERM_LINUX;strcpy(lc.name,"du");lc.argc=2;
+        if(!resolve(s->cwd,i<n?v[i]:".",lc.argv[0]))return say(out,"ERR invalid ux0 path\n");
+        strcpy(lc.argv[1],human?"h":"b");
+        return done(core_raw(ops,&lc,out));
+    }
+    if(eq(verb,"uname")||eq(verb,"whoami")||eq(verb,"hostname")||eq(verb,"uptime")||eq(verb,"free")){
+        wb_cmd lc={0};lc.kind=WB_CMD_TERM_LINUX;strcpy(lc.name,verb);
+        if(eq(verb,"uname")){
+            if(n==2 && eq(v[1],"-a")){lc.argc=1;strcpy(lc.argv[0],"-a");}
+            else if(n!=1)return say(out,"ERR usage: uname [-a]\n");
+        }else if(eq(verb,"free")){
+            if(n==2 && eq(v[1],"-h")){lc.argc=1;strcpy(lc.argv[0],"-h");}
+            else if(n!=1)return say(out,"ERR usage: free [-h]\n");
+        }else if(n!=1)return say(out,"ERR unexpected argument\n");
+        return done(core_raw(ops,&lc,out));
+    }
     if(eq(verb,"ls")||eq(verb,"cd")||eq(verb,"cat")){
         char p[WB_SH_PATH];int i=1;bool ls=eq(verb,"ls"),cd=eq(verb,"cd"),lng=false;
+#ifdef WB_SHELL2
+        if(cd && n==2 && eq(v[1],"-")){
+            char prev[WB_SH_PATH];
+            memcpy(prev,s->oldcwd,sizeof prev);
+            memcpy(s->oldcwd,s->cwd,sizeof s->oldcwd);
+            memcpy(s->cwd,prev,sizeof s->cwd);
+            return done(wb_out_printf(out,"%s\n",s->cwd));
+        }
+#endif
         if(ls && i<n && eq(v[i],"-l")){lng=true;i++;}
         if(i<n && eq(v[i],"--"))++i;
         else if(i<n && v[i][0]=='-')return say(out,"ERR unsupported option; use -- before a dash-prefixed name\n");
         if(n-i>1 || (!cd&&!ls&&n-i!=1))return say(out,"ERR usage: ls [-l] [PATH] | cd [DIR] | cat FILE\n");
         if(!resolve(s->cwd,i<n?v[i]:cd?ROOT:".",p))return say(out,"ERR invalid ux0 path\n");
+#ifdef WB_SHELL2
+        if(eq(p,"/")){
+            if(cd){memcpy(s->oldcwd,s->cwd,sizeof s->oldcwd);strcpy(s->cwd,"/");return 0;}
+            if(ls)return say(out,lng?
+                "drwxr-xr-x            - virtual          ux0/\n"
+                "dr-xr-xr-x            - virtual          ur0/\n"
+                "dr-xr-xr-x            - virtual          uma0/\n"
+                "drwxr-xr-x            - virtual          inbox/\n":
+                "ux0/\nur0/\numa0/\ninbox/\n");
+            return say(out,"ERR not a regular file\n");
+        }
+#endif
         if(cd){
             if(!ops->isdir)return say(out,"ERR directory service unavailable\n");
             int rc=ops->isdir(ops->ctx,p,out);
-            if(rc==0)memcpy(s->cwd,p,strlen(p)+1);
+            if(rc==0){memcpy(s->oldcwd,s->cwd,sizeof s->oldcwd);memcpy(s->cwd,p,strlen(p)+1);}
             return done(rc);
         }
         if(ls&&ops->list)return done(ops->list(ops->ctx,p,lng,out));
@@ -451,6 +803,40 @@ int wb_shell_run(wb_shell_engine *s,const char *line,wb_out *out,const wb_shell_
         return 0;
     }
     if(eq(verb,"app")||eq(verb,"test")||eq(verb,"update")){
+        if(eq(verb,"app")&&n>=2&&(eq(v[1],"ls")||eq(v[1],"list-installed")||eq(v[1],"install-vpk")||
+           eq(v[1],"patch-eboot")||eq(v[1],"launch")||eq(v[1],"remove")||eq(v[1],"prune"))){
+            memset(&c,0,sizeof c);c.kind=WB_CMD_TERM_AGENT_APP;
+            if(eq(v[1],"ls")||eq(v[1],"list-installed")){
+                if(n!=2)return say(out,"ERR usage: app ls\n");
+                strcpy(c.name,"list-installed");return done(core_raw(ops,&c,out));
+            }
+            if(eq(v[1],"prune")){
+                if(n==2){strcpy(c.name,"prune");return done(core_raw(ops,&c,out));}
+                if(n!=3||strlen(v[2])!=9||strspn(v[2],"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")!=9)
+                    return say(out,"ERR usage: app prune [TITLE]\n");
+                strcpy(c.name,"prune");strcpy(c.argv[0],v[2]);c.argc=1;
+                return done(core_raw(ops,&c,out));
+            }
+            if(eq(v[1],"install-vpk")){
+                if(n!=3||!resolve(s->cwd,v[2],c.argv[0])||strncmp(c.argv[0],INCOMING,sizeof INCOMING-1))
+                    return say(out,"ERR usage: app install-vpk /inbox/FILE.vpk\n");
+                strcpy(c.name,"install-vpk");c.argc=1;return done(core_raw(ops,&c,out));
+            }
+            if(eq(v[1],"patch-eboot")){
+                const bool ver=n==6&&eq(v[4],"--ver");
+                if(!(n==4||ver)||strlen(v[2])!=9||strspn(v[2],"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")!=9||
+                   !resolve(s->cwd,v[3],c.argv[1])||strncmp(c.argv[1],INCOMING,sizeof INCOMING-1)||
+                   (ver&&(strlen(v[5])!=5||v[5][2]!='.')))
+                    return say(out,"ERR usage: app patch-eboot TITLE /inbox/eboot.bin [--ver XX.YY]\n");
+                strcpy(c.name,"patch-eboot");strcpy(c.argv[0],v[2]);c.argc=2;
+                if(ver){strcpy(c.argv[2],v[5]);c.argc=3;}
+                return done(core_raw(ops,&c,out));
+            }
+            if(n!=3||strlen(v[2])!=9||strspn(v[2],"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")!=9)
+                return say(out,"ERR usage: app launch|remove TITLE (9-character title id)\n");
+            strcpy(c.name,eq(v[1],"launch")?"launch":"uninstall");strcpy(c.argv[0],v[2]);c.argc=1;
+            return done(core_raw(ops,&c,out));
+        }
         if(eq(verb,"app")&&n>=3&&wb_remove_id(v[2])&&
            (eq(v[1],"status")||eq(v[1],"uninstall-plan")||eq(v[1],"uninstall"))){
             bool commit=eq(v[1],"uninstall");
@@ -465,6 +851,24 @@ int wb_shell_run(wb_shell_engine *s,const char *line,wb_out *out,const wb_shell_
             memset(&c,0,sizeof c);
             c.kind=eq(v[1],"status")?WB_CMD_TERM_SSH_VITA_STATUS:WB_CMD_TERM_SSH_VITA_UNINSTALL;
             c.argc=1;strcpy(c.argv[0],"VSSH00001");return done(core_raw(ops,&c,out));
+        }
+        if(eq(verb,"app")&&n>=2&&eq(v[1],"patch")){
+            const bool apply=n==8&&eq(v[2],"apply");
+            if(!(apply||(n==6&&eq(v[2],"plan")))||!eq(v[3],"RJGM52237")||!eq(v[4],"01.16"))
+                return say(out,"ERR app-patch usage: plan|apply RJGM52237 01.16 INCOMING.bin [R S]\n");
+            if(strlen(v[5])>=WB_CMD_ARG_MAX || strncmp(v[5],INCOMING,sizeof INCOMING-1))
+                return say(out,"ERR app-patch incoming path\n");
+            /* No alias normalization: the signed name must be the exact flat
+             * incoming name. The native adapter checks it independently. */
+            const char *name=v[5]+sizeof INCOMING-1;size_t len=strlen(name);
+            if(len<5 || len>=100 || name[0]=='.' || strstr(name,"..") || strcmp(name+len-4,".bin") ||
+               strspn(name,"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-")!=len)
+                return say(out,"ERR app-patch incoming path\n");
+            if(apply&&(strlen(v[6])!=64||strlen(v[7])!=64||strspn(v[6],"0123456789abcdef")!=64||strspn(v[7],"0123456789abcdef")!=64))
+                return say(out,"ERR app-patch signature format\n");
+            memset(&c,0,sizeof c);c.kind=WB_CMD_TERM_APP_PATCH;c.argc=apply?3:1;
+            strcpy(c.argv[0],v[5]);if(apply){strcpy(c.argv[1],v[6]);strcpy(c.argv[2],v[7]);}
+            return done(core_raw(ops,&c,out));
         }
         if(eq(verb,"app")&&n==2&&eq(v[1],"list")){
             memset(&c,0,sizeof c);c.kind=WB_CMD_TERM_APP_LIST;return done(core_raw(ops,&c,out));
@@ -522,7 +926,9 @@ int wb_shell_run(wb_shell_engine *s,const char *line,wb_out *out,const wb_shell_
         }else if(eq(x,"ls")){
             char p[WB_SH_PATH];
             if(c.argc-first!=1||!resolve(s->cwd,c.argv[first],p))return say(out,"ERR usage: ext ls DIR\n");
-            return ops->list?done(ops->list(ops->ctx,p,false,out)):say(out,"ERR listing unavailable\n");
+            if(!eq(p,"ux0:/app") && strncmp(p,"ux0:/app/",9))
+                return ops->list?done(ops->list(ops->ctx,p,false,out)):say(out,"ERR listing unavailable\n");
+            if(!arg_path(s,c.argv[first],false))return say(out,"ERR path denied\n");
         }else if(eq(x,"stat")||eq(x,"rm")||eq(x,"mv")||eq(x,"mkdir")){
             if(c.argc-first!=(eq(x,"mv")?2:1))return say(out,"ERR invalid file operands\n");
             for(int i=first;i<c.argc;i++)
@@ -545,3 +951,5 @@ int wb_shell_run(wb_shell_engine *s,const char *line,wb_out *out,const wb_shell_
     }
     return done(core_raw(ops,&c,out));
 }
+
+#include "wb_shell_compound.inc"

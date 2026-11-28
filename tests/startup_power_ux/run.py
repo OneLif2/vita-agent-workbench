@@ -21,17 +21,24 @@ POST={'auto-quick-veto':('QUICK OPEN VETO',0),'auto-r1-veto':('R1 VETO OR EXPIRE
       'auto-bad-pair':('QUICK BIND REFUSED',1)}
 def simple_hash(path): return hashlib.sha256(path.read_bytes()).hexdigest()
 def extract(body,a,b): return body[body.index(a):body.index(b,body.index(a))]
+def function(body,signature):
+    start=body.index(signature);opening=body.index('{',start);depth=1
+    for end in range(opening+1,len(body)):
+        depth+=(body[end]=='{')-(body[end]=='}')
+        if depth==0:return body[start:end+1]
+    raise ValueError('Unclosed production function: '+signature)
 def test(src,cases,records):
     src=Path(src).resolve();prod=src/'vita_ssh_status.c'; text=prod.read_text(encoding='utf8')
     with tempfile.TemporaryDirectory(prefix='wbpowerprobe-') as scratch:
         p=Path(scratch);exe=p/('probe.exe' if os.name=='nt' else 'probe')
         parts={'drain.inc':extract(text,'static char pw_diag_source[','/* ---- network ---- */'),
-               'inactive.inc':extract(text,'static int inactive_screen(','int main(void)'),
-               'gate.inc':extract(text,'    const bool update_return = consumed','    if(return_ok){\n        char line[160];snprintf(line,sizeof line,"R1 RETURN LISTENING')}
+               'inactive.inc':function(text,'static int inactive_screen('),
+               'gate.inc':extract(text,'    const bool update_return = consumed','    if(remote_start)remote_start_installed_audit();')}
         assert 'wb_ssh_open(' in parts['gate.inc'] and 'net_setup()' in parts['gate.inc']
+        assert 'idle_screen' not in parts['inactive.inc'] and 'static int inactive_screen(' in parts['inactive.inc']
         assert '(void)inactive_screen(reason);' in text[text.index('\nout:'):], 'main no longer calls inactive_screen(reason)'
         for name,frag in parts.items():(p/name).write_text(frag,encoding='utf8')
-        build=['gcc','-std=c11','-Wall','-Wextra','-Werror','-I'+str(src),'-I'+str(p),str(HERE/'probe.c'),'-o',str(exe)]
+        build=['gcc','-std=c11','-Wall','-Wextra','-Werror','-Wno-unused-function','-I'+str(src),'-I'+str(p),str(HERE/'probe.c'),'-o',str(exe)]
         def op(argv):
             z=subprocess.run(list(map(str,argv)),capture_output=True,text=True,timeout=15)
             records.append(dict(argv=list(map(str,argv)),rc=z.returncode,stdout=z.stdout,stderr=z.stderr))
@@ -55,6 +62,13 @@ def verify(obs,candidate):
         expected=dict(label=label,net_setup_calls=net,ssh_open_calls=opened,diag=diag,power_prompts=manual,
                       ack_pad_reads=ack,auto_ack=auto,wait_ack_log=wait,
                       postgate_pad_reads=int(s in ('auto-r1-veto','auto-r1-bad-veto-input')))
+        if candidate and (s in POST or s.startswith('manual')):
+            # 02.18 agent-operated startup: a paired listener always uses the
+            # automatic power acknowledgement; no R1/quick veto, owner prompt or
+            # post-gate pad read remains. Low battery/suspend/focus/clock still stop.
+            expected=dict(label='',net_setup_calls=1,ssh_open_calls=1,diag='-',power_prompts=0,
+                          ack_pad_reads=0,auto_ack=1,wait_ack_log=0,postgate_pad_reads=0)
+            label=''
         for k,v in expected.items():
             if o[k]!=v:raise AssertionError(f'{s}: {k}: expected {v!r}, actual {o!r}')
         assert bool(o['hint'])==bool(label)

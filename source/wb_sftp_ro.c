@@ -1,3 +1,7 @@
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC optimize ("O3")
+#endif
+#include "wb_transfer_limits.h"
 /* SSH File Transfer Protocol v3 (draft-ietf-secsh-filexfer-02), incoming-only.
  * No shell delegation, overwrites, symbolic links, extension negotiation or
  * native paths. All file/directory descriptors are private to one channel. */
@@ -113,29 +117,37 @@ static wb_sftp_handle *lookup(wb_sftp_ro *s,span token){
     if(slot>=WB_SFTP_HANDLES)return NULL;
     wb_sftp_handle *h=&s->handles[slot];return h->used&&h->serial==serial?h:NULL;
 }
-static void open_file(wb_sftp_ro *s,writer *w,uint32_t id,const char *path,int dir){
+static void open_file(wb_sftp_ro *s,writer *w,uint32_t id,const char *path,int dir,uint64_t hint_size){
     unsigned i=0;while(i<WB_SFTP_HANDLES&&s->handles[i].used)i++;
     if(i==WB_SFTP_HANDLES||s->last_serial==UINT32_MAX){status(w,id,WB_SFTP_FAILURE);return;}
-    int fd=-1,fx;void *stream=NULL;
+    int fd=-1,fx;void *stream=NULL;uint64_t total=0;
     if(dir==2){
         for(unsigned j=0;j<WB_SFTP_HANDLES;j++)if(s->handles[j].used&&s->handles[j].writer){
             status(w,id,WB_SFTP_FAILURE);return;
         }
         fx=s->create->open(s->create->ctx,path,&stream);
         if(fx||!stream){status(w,id,fx?fx:WB_SFTP_FAILURE);return;}
+        if(hint_size<=WB_TRANSFER_MAX)total=hint_size;
     }else{
         fx=s->ops->open(s->ops->ctx,path,dir,&fd);
         if(fx||fd<0){status(w,id,fx?fx:WB_SFTP_FAILURE);return;}
+        if(!dir&&s->ops->fstat){
+            wb_sftp_attr a={0};
+            if(s->ops->fstat(s->ops->ctx,fd,0,&a)==WB_SFTP_OK&&!a.is_dir)total=a.size;
+        }
     }
     wb_sftp_handle *h=&s->handles[i];*h=(wb_sftp_handle){
-        .used=1,.dir=dir==1,.fd=fd,.serial=++s->last_serial,.writer=stream};
+        .used=1,.dir=dir==1,.fd=fd,.serial=++s->last_serial,.writer=stream,.total=total};
     msg(w,HANDLE,id);put32(w,8);put32(w,i);put32(w,h->serial);
 }
-/* Ignore known open attributes on a read-only open, after validating their
- * v3 representation. The file is never created and attributes never applied. */
-static int open_attrs(reader *r){
+/* Validate v3 open attributes; capture optional SSH_FILEXFER_ATTR_SIZE hint
+ * (used only for the local progress bar, never as a storage trust boundary). */
+static int open_attrs(reader *r,uint64_t *size_out){
     uint32_t f=u32(r);if(f&~15u)return 0;
-    if(f&1){(void)u32(r);(void)u32(r);}
+    if(f&1){
+        uint64_t sz=((uint64_t)u32(r)<<32)|u32(r);
+        if(size_out)*size_out=sz;
+    }
     if(f&2){(void)u32(r);(void)u32(r);}
     if(f&4)(void)u32(r);
     if(f&8){(void)u32(r);(void)u32(r);}
@@ -154,18 +166,18 @@ int wb_sftp_reply(wb_sftp_ro *s,const uint8_t *body,size_t n,uint8_t *out,size_t
         s->initialized=1;byte(&w,VERSION);put32(&w,3);
     }else if(!s->initialized)return -1;
     else if(kind==REALPATH||kind==STAT||kind==LSTAT||kind==OPEN||kind==OPENDIR||(kind==MKDIR&&s->create)){
-        char path[WB_SFTP_PATH_MAX];span operand=string(&r);uint32_t flags=0;
+        char path[WB_SFTP_PATH_MAX];span operand=string(&r);uint32_t flags=0;uint64_t hint_size=0;
         if(kind==OPEN)flags=u32(&r);
-        if(r.bad||((kind==OPEN||kind==MKDIR)?!open_attrs(&r):!done(&r)))status(&w,id,WB_SFTP_BAD_MESSAGE);
+        if(r.bad||((kind==OPEN||kind==MKDIR)?!open_attrs(&r,kind==OPEN?&hint_size:NULL):!done(&r)))status(&w,id,WB_SFTP_BAD_MESSAGE);
         else if(!pathof(operand,path))status(&w,id,WB_SFTP_DENIED);
         else if(kind==OPEN&&flags!=1u){
             /* OpenSSH scp uses WRITE|CREATE|TRUNC even for a fresh file.
              * TRUNC is never honored on existing files; native publish is no-replace. */
             if(!s->create||!strcmp(path,"/")||(flags!=10u&&flags!=26u&&flags!=42u))
                 status(&w,id,WB_SFTP_DENIED);
-            else open_file(s,&w,id,path,2);
+            else open_file(s,&w,id,path,2,hint_size);
         }else if(kind==MKDIR)status(&w,id,strcmp(path,"/")?s->create->mkdir(s->create->ctx,path):WB_SFTP_DENIED);
-        else if(kind==OPEN||kind==OPENDIR)open_file(s,&w,id,path,kind==OPENDIR);
+        else if(kind==OPEN||kind==OPENDIR)open_file(s,&w,id,path,kind==OPENDIR,0);
         else {
             wb_sftp_attr a={0};fx=s->ops->stat(s->ops->ctx,path,&a);
             if(fx==WB_SFTP_NO_FILE&&kind==REALPATH&&s->create&&strcmp(path,"/")){
@@ -200,7 +212,7 @@ int wb_sftp_reply(wb_sftp_ro *s,const uint8_t *body,size_t n,uint8_t *out,size_t
         if(h&&h->writer){
             if(!done(&r))fx=WB_SFTP_BAD_MESSAGE;
             else if(h->poison||off!=h->offset||data.n>WB_SFTP_DATA_MAX||
-                    h->offset>WB_UPLOAD_MAX||data.n>WB_UPLOAD_MAX-h->offset)fx=WB_SFTP_FAILURE;
+                    h->offset>WB_TRANSFER_MAX||data.n>WB_TRANSFER_MAX-h->offset)fx=WB_SFTP_FAILURE;
             else {fx=s->create->write(s->create->ctx,h->writer,data.s,data.n);if(!fx)h->offset+=data.n;}
             if(fx)h->poison=1;
         }
@@ -226,7 +238,10 @@ int wb_sftp_reply(wb_sftp_ro *s,const uint8_t *body,size_t n,uint8_t *out,size_t
             fx=want?s->ops->read(s->ops->ctx,h->fd,off,out+9,want,&got):WB_SFTP_OK;
             if(fx||got>want)status(&w,id,fx?fx:WB_SFTP_FAILURE);
             else if(want&&!got)status(&w,id,WB_SFTP_EOF);
-            else {msg(&w,DATA,id);put32(&w,(uint32_t)got);w.n+=got;}
+            else {
+                if(off+got>h->offset)h->offset=off+got;
+                msg(&w,DATA,id);put32(&w,(uint32_t)got);w.n+=got;
+            }
         }else{
             char name[WB_SFTP_NAME_MAX+1]={0};wb_sftp_attr a={0};
             fx=s->ops->readdir(s->ops->ctx,h->fd,name,sizeof name,&a);

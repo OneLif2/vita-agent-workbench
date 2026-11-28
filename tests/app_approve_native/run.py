@@ -20,7 +20,7 @@ FIXTURE = r'''
 #include "wb_vita_io.h"
 
 /* Stubs for the two device I/O calls the row table uses. */
-static char local_text[4096];
+static char local_text[16384];
 static size_t local_len;
 static bool local_present;
 int wb_vita_read_small(const char *p, void *buf, size_t cap, size_t *n) {
@@ -30,7 +30,8 @@ int wb_vita_read_small(const char *p, void *buf, size_t cap, size_t *n) {
     memcpy(buf, local_text, local_len); *n = local_len; return WB_OK;
 }
 int wb_vita_write_file(const char *p, const void *d, size_t n, bool append) {
-    (void)p; (void)append;
+    (void)p;
+    if (!append) local_len = 0;
     if (local_len + n > sizeof local_text) return WB_E_IO;
     memcpy(local_text + local_len, d, n); local_len += n; local_text[local_len] = 0;
     local_present = true; return WB_OK;
@@ -84,7 +85,22 @@ int main(void) {
              "RJGM52237 01.02 8d1f6043edb6f594bd4bca0b8c42d31a9b91f6b0c0d963c4041313fdfad0d22d -\n");
     RK(wb_app_local_count != 1);
 
-    puts("PASS owner-signed runtime rows are exact, install-only and bounded");
+    /* 02.20: capacity raised to 64 rows + prune by title and all */
+    RK(WB_APP_LOCAL_ROWS != 64);
+    set_file("");
+    for (unsigned i = 0; i < 20; i++) {
+        char ver[6];
+        snprintf(ver, sizeof ver, "01.%02u", i);
+        RK(!wb_app_local_add(i < 12 ? "RJGP52237" : "RJGM52237", ver, sha));
+    }
+    RK(wb_app_local_count != 20);
+    unsigned removed = 0;
+    RK(!wb_app_local_prune("RJGP52237", &removed));
+    RK(removed != 12 || wb_app_local_count != 8);
+    RK(!wb_app_local_prune(NULL, &removed));
+    RK(removed != 8 || wb_app_local_count != 0);
+
+    puts("PASS owner-signed runtime rows are exact, install-only, 64-row bounded and prunable");
     return 0;
 }
 '''
